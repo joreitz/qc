@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """
-qc — Projektmanager für QC-Rechnungen
-=====================================
-Projekte registrieren, Shortcuts aus commands.json ausführen,
-Pfad-Bookmarks pro Projekt, Print-Modus, History.
+qc - project manager and analysis tool for quantum-chemical calculations.
 
-Für 'qc go <mark>' (echtes cd) einmalig in die ~/.bashrc:
+  * projects, command shortcuts (commands.json) and directory bookmarks
+  * thermochemistry (E/U/H/G, reaction energies) from the CSV summaries of the
+    calculations, configured per project in data.yaml
+  * relaxed PES scans: table, CSV export and publication-ready plots
+
+Run `qc` for an overview and `qc <command> -h` for details.
+
+Shell integration (cd for `qc go`, tab completion) - once in ~/.bashrc or ~/.zshrc:
     eval "$(qc shellrc)"
+
+Requirements: Python >= 3.8; pandas + PyYAML for everything that reads data;
+matplotlib for plots; ruamel.yaml (optional) keeps comments in data.yaml.
 """
 
+import argparse
+import ast
+import csv
 import difflib
+import fnmatch
 import json
 import math
 import os
@@ -17,477 +28,726 @@ import re
 import shlex
 import subprocess
 import sys
+import textwrap
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-# --- KONFIGURATION ---
-GLOBAL_CONFIG_FILE = Path.home() / ".qc_manager_config.json"
-PROJECT_CONFIG_NAME = "commands.json"
-HISTORY_NAME = ".qc_history"
-PROJECT_FOLDERS = [
-    "scratch",
-    "0_confsampling",
-    "1_optfreq",
-    "2_sp",
-    "3_solv",
-    "xyz",
-]
-RESERVED = {
-    "init", "add", "rm", "switch", "list", "cmds", "rmcmd",
-    "mark", "marks", "unmark", "go", "status", "edit",
-    "history", "shellrc", "help", "-h", "--help",
-    "data", "species", "e", "u", "h", "g", "rxn", "scan",
-}
+__version__ = "2.0"
 
-DEFAULT_COMMANDS = {
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Constants
+# ════════════════════════════════════════════════════════════════════════════
+
+REGISTRY_FILE = Path.home() / ".qc_manager_config.json"
+ARCHIVE_DIR = Path.home() / ".qc_data"
+COMMANDS_FILE = "commands.json"
+DATA_FILE = "data.yaml"
+HISTORY_FILE = ".qc_history"
+
+PROJECT_FOLDERS = ["scratch", "0_confsampling", "1_optfreq", "2_sp", "3_solv", "xyz"]
+
+DEFAULT_SHORTCUTS = {
     "geomopt": "inporca -j optfreq -f wb97x-3c -dp no -fn -optt tight",
     "sp": "inporca -j sp -f r2scan0 -bs def2-QZVPPD -dp d4 -fn",
     "freq": "inporca -j freq -f wb97x-3c -dp no -fn",
 }
 
-
-# --- HILFSFUNKTIONEN: GLOBALE CONFIG ---
-
-def load_global_config():
-    if not GLOBAL_CONFIG_FILE.exists():
-        return {"projects": {}, "active_project": None}
-    try:
-        with open(GLOBAL_CONFIG_FILE) as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        print(f"[WARN] {GLOBAL_CONFIG_FILE} ist korrupt — starte mit leerer Config.",
-              file=sys.stderr)
-        return {"projects": {}, "active_project": None}
-
-
-def save_global_config(config):
-    with open(GLOBAL_CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=4)
-
-
-# --- HILFSFUNKTIONEN: PROJEKT-CONFIG ---
-
-def project_config_path(project_path):
-    return Path(project_path) / PROJECT_CONFIG_NAME
-
-
-def load_project_config(project_path):
-    """
-    Lädt commands.json. Altes Format (flaches Dict aus Shortcuts) wird
-    automatisch ins neue Format {"commands": {...}, "paths": {...}} migriert.
-    """
-    cfg_file = project_config_path(project_path)
-    if not cfg_file.exists():
-        print(f"Fehler: Keine {PROJECT_CONFIG_NAME} im Projekt-Root gefunden:\n{project_path}",
-              file=sys.stderr)
-        sys.exit(1)
-    with open(cfg_file) as f:
-        data = json.load(f)
-
-    # Migration: altes flaches Format erkennen
-    if "commands" not in data and "paths" not in data:
-        data = {"commands": data, "paths": {}}
-    data.setdefault("commands", {})
-    data.setdefault("paths", {})
-    return data
-
-
-def save_project_config(project_path, data):
-    with open(project_config_path(project_path), "w") as f:
-        json.dump(data, f, indent=4)
-
-
-def detect_current_project(config):
-    """
-    Prüft, ob der aktuelle Ordner zu einem registrierten Projekt gehört.
-    Rückgabe: (name, Path, is_local) — is_local=True bei automatischer Erkennung,
-    sonst Fallback auf das global aktive Projekt.
-    """
-    current_path = Path.cwd().resolve()
-
-    # Längste Pfade zuerst, damit verschachtelte Projekte korrekt greifen
-    sorted_projects = sorted(config["projects"].items(),
-                             key=lambda x: len(str(x[1])), reverse=True)
-    for name, p_path_str in sorted_projects:
-        p_path = Path(p_path_str).resolve()
-        if current_path == p_path or p_path in current_path.parents:
-            return name, p_path, True
-
-    active = config.get("active_project")
-    if active and active in config["projects"]:
-        return active, Path(config["projects"][active]), False
-
-    return None, None, False
-
-
-def require_project(config):
-    name, path, is_local = detect_current_project(config)
-    if not name:
-        print("Fehler: Kein Projekt gefunden. Nutze 'qc init <name>' oder geh in einen Projektordner.",
-              file=sys.stderr)
-        sys.exit(1)
-    return name, path, is_local
-
-
-def suggest(word, candidates):
-    matches = difflib.get_close_matches(word, candidates, n=3, cutoff=0.5)
-    if matches:
-        print(f"Meintest du: {', '.join(matches)}?", file=sys.stderr)
-
-
-# --- PROJEKTE ---
-
-def init_project(project_name):
-    root_path = Path.cwd() / project_name
-    print(f"--- Initialisiere Projekt: {project_name} ---")
-
-    if root_path.exists():
-        print(f"[INFO] Ordner '{project_name}' existiert bereits.")
-    else:
-        try:
-            root_path.mkdir()
-            print(f"[OK] Hauptordner erstellt: {root_path}")
-        except OSError as e:
-            print(f"[ERROR] Konnte Ordner nicht erstellen: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    for folder in PROJECT_FOLDERS:
-        (root_path / folder).mkdir(exist_ok=True)
-
-    cfg_file = project_config_path(root_path)
-    if not cfg_file.exists():
-        save_project_config(root_path, {"commands": dict(DEFAULT_COMMANDS), "paths": {}})
-        print(f"[OK] {PROJECT_CONFIG_NAME} erstellt.")
-
-    register_project(project_name, str(root_path))
-
-
-def register_project(name, path=None):
-    config = load_global_config()
-    target_path = str(Path(path).resolve()) if path else str(Path.cwd().resolve())
-    config["projects"][name] = target_path
-    config["active_project"] = name
-    save_global_config(config)
-    print(f"[SUCCESS] Projekt '{name}' registriert.")
-    print(f"          Pfad: {target_path}")
-
-
-def remove_project(name):
-    config = load_global_config()
-    if name not in config["projects"]:
-        print(f"Fehler: Projekt '{name}' ist unbekannt.", file=sys.stderr)
-        suggest(name, config["projects"].keys())
-        sys.exit(1)
-    del config["projects"][name]
-    if config.get("active_project") == name:
-        config["active_project"] = None
-    save_global_config(config)
-    print(f"[OK] Projekt '{name}' entfernt (Ordner und Dateien bleiben unberührt).")
-
-
-def switch_project(name):
-    config = load_global_config()
-    if name not in config["projects"]:
-        print(f"Fehler: Projekt '{name}' ist unbekannt.", file=sys.stderr)
-        suggest(name, config["projects"].keys())
-        sys.exit(1)
-    config["active_project"] = name
-    save_global_config(config)
-    print(f"--> Globales aktives Projekt: {name}")
-
-
-def list_projects():
-    config = load_global_config()
-    detected_name, _, is_local = detect_current_project(config)
-    global_active = config.get("active_project")
-
-    if not config["projects"]:
-        print("Keine Projekte registriert. Nutze 'qc init <name>'.")
-        return
-
-    print("--- Projekte ---")
-    for name, path in config["projects"].items():
-        markers = []
-        if name == global_active:
-            markers.append("(global active)")
-        if name == detected_name and is_local:
-            markers.append("<-- DU BIST HIER")
-        marker_str = " " + " ".join(markers) if markers else ""
-        print(f" [{name}] {path}{marker_str}")
-
-
-# --- COMMANDS ---
-
-def add_command(assignment):
-    """qc add name="befehl ..." — fügt einen Shortcut zur commands.json hinzu."""
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-
-    name, _, cmd = assignment.partition("=")
-    name = name.strip().strip('"').strip("'")
-    cmd = cmd.strip().strip('"').strip("'")
-
-    if not name or not cmd:
-        print('Fehler: Format ist  qc add name="befehl"', file=sys.stderr)
-        sys.exit(1)
-    if name in RESERVED:
-        print(f"Fehler: '{name}' ist ein reservierter qc-Befehl.", file=sys.stderr)
-        sys.exit(1)
-
-    pcfg = load_project_config(project_path)
-    action = "aktualisiert" if name in pcfg["commands"] else "hinzugefügt"
-    pcfg["commands"][name] = cmd
-    save_project_config(project_path, pcfg)
-    print(f"[OK] Shortcut '{name}' in Projekt '{project_name}' {action}:")
-    print(f"     {cmd}")
-
-
-def remove_command(name):
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    pcfg = load_project_config(project_path)
-    if name not in pcfg["commands"]:
-        print(f"Fehler: Shortcut '{name}' nicht in Projekt '{project_name}'.", file=sys.stderr)
-        suggest(name, pcfg["commands"].keys())
-        sys.exit(1)
-    del pcfg["commands"][name]
-    save_project_config(project_path, pcfg)
-    print(f"[OK] Shortcut '{name}' entfernt.")
-
-
-def list_commands():
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    pcfg = load_project_config(project_path)
-    print(f"--- Shortcuts in '{project_name}' ---")
-    if not pcfg["commands"]:
-        print(" (keine)")
-        return
-    width = max(len(k) for k in pcfg["commands"])
-    for k, v in pcfg["commands"].items():
-        print(f" {k:<{width}}  {v}")
-
-
-# --- BOOKMARKS (temporäre Pfade) ---
-
-def mark_path(name, path=None):
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    target = Path(path).resolve() if path else Path.cwd().resolve()
-    if not target.is_dir():
-        print(f"Fehler: Ordner existiert nicht: {target}", file=sys.stderr)
-        sys.exit(1)
-    pcfg = load_project_config(project_path)
-    pcfg["paths"][name] = str(target)
-    save_project_config(project_path, pcfg)
-    print(f"[OK] Bookmark '{name}' -> {target}  (Projekt: {project_name})")
-
-
-def unmark_path(name):
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    pcfg = load_project_config(project_path)
-    if name not in pcfg["paths"]:
-        print(f"Fehler: Bookmark '{name}' nicht in Projekt '{project_name}'.", file=sys.stderr)
-        suggest(name, pcfg["paths"].keys())
-        sys.exit(1)
-    del pcfg["paths"][name]
-    save_project_config(project_path, pcfg)
-    print(f"[OK] Bookmark '{name}' entfernt.")
-
-
-def list_marks():
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    pcfg = load_project_config(project_path)
-    print(f"--- Bookmarks in '{project_name}' ---")
-    if not pcfg["paths"]:
-        print(" (keine) — setze eins mit 'qc mark <name>' im Zielordner")
-        return
-    width = max(len(k) for k in pcfg["paths"])
-    for k, v in pcfg["paths"].items():
-        missing = "" if Path(v).is_dir() else "  [FEHLT!]"
-        print(f" {k:<{width}}  {v}{missing}")
-
-
-def go_mark(name):
-    """
-    Gibt NUR den Pfad auf stdout aus (alles andere auf stderr),
-    damit der Shell-Wrapper 'cd $(qc go name)' machen kann.
-    Sonderfall: 'qc go .' bzw. 'qc go root' -> Projekt-Root.
-    """
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-
-    if name in (".", "root"):
-        print(project_path)
-        return
-
-    pcfg = load_project_config(project_path)
-    if name not in pcfg["paths"]:
-        print(f"Fehler: Bookmark '{name}' nicht in Projekt '{project_name}'.", file=sys.stderr)
-        suggest(name, list(pcfg["paths"].keys()) + ["root"])
-        sys.exit(1)
-
-    target = Path(pcfg["paths"][name])
-    if not target.is_dir():
-        print(f"Fehler: Ordner existiert nicht mehr: {target}", file=sys.stderr)
-        sys.exit(1)
-    print(target)
-
-
-# --- DATEN / THERMOCHEMIE (data.yaml) ---
-
-DATA_CONFIG_NAME = "data.yaml"
-MAIN_DATA_DIR = Path.home() / ".qc_data"
+# Data roles: which kind of CSV a source is
 ROLES = ("thermo", "sp", "solv", "boltz", "bfreq")
-
-HARTREE_TO_KCAL = 627.5094740631
-UNIT_CONVERSION = {
-    "hartree": 1.0,
-    "eh": 1.0,
-    "kcal/mol": HARTREE_TO_KCAL,
-    "kj/mol": 2625.4996394799,
-    "ev": 27.211386245988,
+ROLE_INFO = {
+    "thermo": "ENERGY + thermal corrections dU/dH/dG (e.g. optfreq jobs)",
+    "sp": "ENERGY of single points (several functionals allowed)",
+    "solv": "solvation free energies Gsolv(Eh) (several solvents allowed)",
+    "boltz": "conformer ensembles (CENSO): G_LOW, G_AV",
+    "bfreq": "single-point (biased) Hessian thermal correction dG(Eh)",
 }
-R_KCAL = 1.98720425864083e-3  # kcal/(mol K)
+
+# Physical constants (CODATA 2018)
+HARTREE_TO_KCAL = 627.5094740631
+HARTREE_TO_KJ = 2625.4996394799
+HARTREE_TO_EV = 27.211386245988
+R_KCAL = 1.98720425864083e-3   # kcal/(mol K)
+R_LATM = 0.0820573660809596    # L atm/(mol K)
+
+# key: (factor from Eh, display label, decimals)
+UNITS = {
+    "eh": (1.0, "Eh", 8),
+    "hartree": (1.0, "Eh", 8),
+    "kcal/mol": (HARTREE_TO_KCAL, "kcal/mol", 3),
+    "kj/mol": (HARTREE_TO_KJ, "kJ/mol", 3),
+    "ev": (HARTREE_TO_EV, "eV", 3),
+}
+
+QUANTITY_COLUMN = {"U": "dU", "H": "dH", "G": "dG"}
+COEFF_RE = re.compile(r"^(\d+(?:\.\d+)?)\s+(.+)$")
 
 DEFAULT_STRIP_SUFFIXES = ["optfreq", "opt", "freq", "sp", "solv", "dock",
                           "censo", "crest", "conf", "boltz", "bfreq", "sph"]
+DEFAULT_SETTINGS = {
+    "unit": "kcal/mol",
+    "temperature": 298.15,
+    "solvation": False,
+    "solvent": None,
+    "boltzmann": False,
+    "bfreq": False,          # bfreq instead of thermo for G (e/u/h/g, rxn)
+    "scan_bfreq": "auto",    # auto: bfreq if it covers the scan, else thermo
+    "state_correction": False,
+    "method_sp": None,
+    "method_thermo": None,
+    "method_solv": None,
+    "method_boltz": None,
+    "method_bfreq": None,
+}
+DEFAULT_CHECKS = {"scf": True, "geoconv": False, "character": True}
+DEFAULT_GEOMETRIES = ["xyz/{name}.xyz", "1_optfreq/{name}.xyz", "{name}.xyz"]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Console output
+# ════════════════════════════════════════════════════════════════════════════
+
+class QCError(Exception):
+    """A user-facing error: printed as 'error: ...', exit status 1."""
+
+
+_WARNINGS_SEEN = set()
+
+
+def _color(stream):
+    return (hasattr(stream, "isatty") and stream.isatty()
+            and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb")
+
+
+def style(text, code, stream=None):
+    return f"\033[{code}m{text}\033[0m" if _color(stream or sys.stdout) else text
+
+
+def bold(text):
+    return style(text, "1")
+
+
+def dim(text, stream=None):
+    return style(text, "2", stream)
+
+
+def warn(msg):
+    """Print a warning to stderr (each distinct message only once per run)."""
+    if msg in _WARNINGS_SEEN:
+        return
+    _WARNINGS_SEEN.add(msg)
+    print(f"{style('warning:', '33;1', sys.stderr)} {msg}", file=sys.stderr)
+
+
+def note(msg):
+    print(f"{style('note:', '36;1', sys.stderr)} {msg}", file=sys.stderr)
+
+
+def did_you_mean(word, candidates):
+    hits = difflib.get_close_matches(word, list(candidates), n=3, cutoff=0.5)
+    return f"\nDid you mean: {', '.join(hits)}?" if hits else ""
+
+
+def print_table(rows, header=None, align=None, indent="  "):
+    """Print rows as aligned columns; align is a string of 'l'/'r' per column."""
+    rows = [[str(c) for c in r] for r in rows]
+    every = ([list(header)] if header else []) + rows
+    if not every:
+        return
+    ncol = max(len(r) for r in every)
+    widths = [max((len(r[i]) for r in every if i < len(r)), default=0) for i in range(ncol)]
+    align = (align or "").ljust(ncol, "l")
+
+    def line(r):
+        cells = [c.rjust(widths[i]) if align[i] == "r" else c.ljust(widths[i])
+                 for i, c in enumerate(r)]
+        return (indent + "  ".join(cells)).rstrip()
+
+    if header:
+        print(bold(line(header)))
+    for r in rows:
+        print(line(r))
+
+
+def heading(text):
+    print(bold(text))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Files
+# ════════════════════════════════════════════════════════════════════════════
+
+def write_text_atomic(path, text):
+    """Write via a temporary file so that an interrupted write never truncates."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_json(path, data):
+    write_text_atomic(path, json.dumps(data, indent=4, ensure_ascii=False) + "\n")
+
+
+def open_in_editor(path):
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    return subprocess.run(shlex.split(editor) + [str(path)]).returncode
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Projects
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_registry():
+    if not REGISTRY_FILE.exists():
+        return {"projects": {}, "active_project": None}
+    try:
+        reg = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise QCError(f"cannot read the project registry {REGISTRY_FILE}: {e}")
+    reg.setdefault("projects", {})
+    reg.setdefault("active_project", None)
+    return reg
+
+
+def save_registry(reg):
+    write_json(REGISTRY_FILE, reg)
+
+
+class Project:
+    """A registered project. `here` is True if the cwd lies inside it."""
+
+    def __init__(self, name, root, here):
+        self.name = name
+        self.root = Path(root)
+        self.here = here
+
+    @property
+    def commands_file(self):
+        return self.root / COMMANDS_FILE
+
+    @property
+    def data_file(self):
+        return self.root / DATA_FILE
+
+    def load_commands(self):
+        """commands.json: {"commands": {...}, "paths": {...}} (paths = bookmarks)."""
+        f = self.commands_file
+        if not f.exists():
+            return {"commands": {}, "paths": {}}
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise QCError(f"{f} is not valid JSON: {e}")
+        if "commands" not in data and "paths" not in data:   # very old flat format
+            data = {"commands": data, "paths": {}}
+        data.setdefault("commands", {})
+        data.setdefault("paths", {})
+        return data
+
+    def save_commands(self, data):
+        write_json(self.commands_file, data)
+
+
+def find_project(reg=None):
+    """The project containing the cwd, else the active project, else None."""
+    reg = reg or load_registry()
+    cwd = Path.cwd().resolve()
+    # longest path first, so that nested projects win
+    for name, path in sorted(reg["projects"].items(), key=lambda kv: len(kv[1]), reverse=True):
+        root = Path(path).resolve()
+        if cwd == root or root in cwd.parents:
+            return Project(name, root, here=True)
+    active = reg.get("active_project")
+    if active in reg["projects"]:
+        return Project(active, reg["projects"][active], here=False)
+    return None
+
+
+def current_project():
+    project = find_project()
+    if project is None:
+        raise QCError("no project here and no active project.\n"
+                      "Create one with 'qc init <name>' or register this folder with "
+                      "'qc project add'.")
+    return project
+
+
+def require_registered(reg, name):
+    if name not in reg["projects"]:
+        raise QCError(f"unknown project '{name}'." + did_you_mean(name, reg["projects"]))
+
+
+def cmd_init(args):
+    reg = load_registry()
+    root = (Path.cwd() / args.name).resolve()
+    known = reg["projects"].get(args.name)
+    if known and Path(known).resolve() != root:
+        raise QCError(f"a project '{args.name}' is already registered at {known}.\n"
+                      f"Pick another name or remove it first with 'qc project rm {args.name}'.")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        for folder in PROJECT_FOLDERS:
+            (root / folder).mkdir(exist_ok=True)
+    except OSError as e:
+        raise QCError(f"cannot create {root}: {e}")
+    project = Project(args.name, root, here=False)
+    if not project.commands_file.exists():
+        project.save_commands({"commands": dict(DEFAULT_SHORTCUTS), "paths": {}})
+    if not project.data_file.exists():
+        project.data_file.write_text(DATA_TEMPLATE, encoding="utf-8")
+    reg["projects"][args.name] = str(root)
+    reg["active_project"] = args.name
+    save_registry(reg)
+    print(f"Created project '{args.name}' in {root}")
+    print(f"  folders: {', '.join(PROJECT_FOLDERS)}")
+    print(f"  files:   {COMMANDS_FILE}, {DATA_FILE}")
+    print("It is now the active project.")
+
+
+def cmd_project_ls(args):
+    reg = load_registry()
+    if not reg["projects"]:
+        print("No projects registered. Create one with 'qc init <name>'.")
+        return
+    here = find_project(reg)
+    rows = []
+    for name, path in sorted(reg["projects"].items()):
+        tags = []
+        if name == reg.get("active_project"):
+            tags.append("active")
+        if here and here.here and name == here.name:
+            tags.append("current")
+        if not Path(path).is_dir():
+            tags.append("missing!")
+        rows.append(["*" if "current" in tags else " ", name, path, ", ".join(tags)])
+    print_table(rows, header=["", "project", "path", ""], indent=" ")
+
+
+def cmd_project_add(args):
+    reg = load_registry()
+    root = Path(args.path).expanduser().resolve() if args.path else Path.cwd().resolve()
+    if not root.is_dir():
+        raise QCError(f"not a directory: {root}")
+    name = args.name or root.name
+    known = reg["projects"].get(name)
+    if known and Path(known).resolve() != root:
+        raise QCError(f"a project '{name}' is already registered at {known}.\n"
+                      f"Pick another name or remove it first with 'qc project rm {name}'.")
+    for other, path in reg["projects"].items():
+        if other != name and Path(path).resolve() == root:
+            warn(f"this folder is also registered as project '{other}'.")
+    reg["projects"][name] = str(root)
+    reg["active_project"] = name
+    save_registry(reg)
+    print(f"Registered project '{name}' at {root} (now active).")
+
+
+def cmd_project_rm(args):
+    reg = load_registry()
+    require_registered(reg, args.name)
+    del reg["projects"][args.name]
+    if reg.get("active_project") == args.name:
+        reg["active_project"] = None
+    save_registry(reg)
+    print(f"Unregistered project '{args.name}' (no files were deleted).")
+
+
+def cmd_project_switch(args):
+    reg = load_registry()
+    require_registered(reg, args.name)
+    reg["active_project"] = args.name
+    save_registry(reg)
+    print(f"Active project: {args.name}")
+
+
+def cmd_status(args):
+    project = find_project()
+    if project is None:
+        print("No project here and no active project.")
+        return
+    mode = "current directory" if project.here else "active project, you are outside of it"
+    cmds = project.load_commands()
+    rows = [["project", f"{project.name}  ({mode})"],
+            ["root", str(project.root)],
+            ["shortcuts", ", ".join(cmds["commands"]) or "-"],
+            ["bookmarks", ", ".join(cmds["paths"]) or "-"]]
+    if project.data_file.exists():
+        try:
+            cfg = load_data_config(project)
+            roles = [r for r in ROLES if source_entries(cfg["sources"].get(r))]
+            rows.append(["data", f"{DATA_FILE}: {', '.join(roles) or 'no sources yet'}"])
+            rows.append(["reactions", ", ".join(cfg["reactions"]) or "-"])
+        except QCError as e:
+            rows.append(["data", f"{DATA_FILE}: {e}"])
+    else:
+        rows.append(["data", f"no {DATA_FILE} (create one with 'qc data init')"])
+    print_table(rows, indent="")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Shortcuts
+# ════════════════════════════════════════════════════════════════════════════
+
+def cmd_cmd_ls(args):
+    project = current_project()
+    cmds = project.load_commands()["commands"]
+    heading(f"Shortcuts of '{project.name}'")
+    if not cmds:
+        print("  (none) - add one with: qc cmd add <name> \"<command>\"")
+        return
+    print_table(sorted(cmds.items()))
+
+
+def cmd_cmd_add(args):
+    project = current_project()
+    if args.name in RESERVED:
+        raise QCError(f"'{args.name}' is a qc command and cannot be a shortcut name.")
+    if args.name.startswith("-"):
+        raise QCError("shortcut names must not start with '-'.")
+    if not args.command:
+        raise QCError(f"no command given: qc cmd add {args.name} \"<command>\"")
+    # one quoted word is taken verbatim; several words are re-quoted for the shell
+    command = args.command[0] if len(args.command) == 1 else shlex.join(args.command)
+    data = project.load_commands()
+    action = "Updated" if args.name in data["commands"] else "Added"
+    data["commands"][args.name] = command
+    project.save_commands(data)
+    print(f"{action} shortcut '{args.name}' in '{project.name}':\n  {command}")
+
+
+def cmd_cmd_rm(args):
+    project = current_project()
+    data = project.load_commands()
+    if args.name not in data["commands"]:
+        raise QCError(f"no shortcut '{args.name}' in project '{project.name}'."
+                      + did_you_mean(args.name, data["commands"]))
+    del data["commands"][args.name]
+    project.save_commands(data)
+    print(f"Removed shortcut '{args.name}'.")
+
+
+def cmd_cmd_edit(args):
+    project = current_project()
+    if not project.commands_file.exists():
+        project.save_commands({"commands": {}, "paths": {}})
+    return open_in_editor(project.commands_file)
+
+
+def run_shortcut(name, extra, print_only=False):
+    project = find_project()
+    shortcuts = project.load_commands()["commands"] if project else {}
+    if name not in shortcuts:
+        msg = f"unknown command '{name}'"
+        if project:
+            msg += f" (and no shortcut of that name in project '{project.name}')"
+        msg += "." + did_you_mean(name, list(COMMAND_NAMES) + list(shortcuts))
+        msg += "\nRun 'qc' for the list of commands" + (", 'qc cmd' for the shortcuts." if project
+                                                       else ".")
+        raise QCError(msg)
+    command = shortcuts[name] + (" " + shlex.join(extra) if extra else "")
+    if print_only:
+        print(command)
+        return 0
+    if not project.here:
+        note(f"outside of any project - using the shortcuts of the active project "
+             f"'{project.name}'.")
+    print(dim(f"$ {command}", sys.stderr), file=sys.stderr)
+    rc = subprocess.run(command, shell=True).returncode
+    log_history(project, command, rc)
+    return rc
+
+
+def log_history(project, command, rc):
+    try:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        status = f"  [exit {rc}]" if rc else ""
+        with open(project.root / HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{stamp}  {os.getcwd()}  {command}{status}\n")
+    except OSError:
+        pass   # the history is a convenience and must never break a run
+
+
+def cmd_history(args):
+    project = current_project()
+    hist = project.root / HISTORY_FILE
+    lines = hist.read_text(encoding="utf-8").splitlines() if hist.exists() else []
+    if not lines:
+        print(f"No shortcuts run yet in '{project.name}'.")
+        return
+    lines = lines[-args.n:]
+    heading(f"Last {len(lines)} shortcut runs in '{project.name}'")
+    for line in lines:
+        print("  " + line)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Bookmarks
+# ════════════════════════════════════════════════════════════════════════════
+
+def cmd_mark_ls(args):
+    project = current_project()
+    marks = project.load_commands()["paths"]
+    heading(f"Bookmarks of '{project.name}'")
+    if not marks:
+        print("  (none) - bookmark a directory with: qc mark add <name> [dir]")
+        return
+    rows = [[k, v + ("" if Path(v).is_dir() else "   [missing]")] for k, v in sorted(marks.items())]
+    print_table(rows)
+
+
+def cmd_mark_add(args):
+    project = current_project()
+    if args.name in ("root",):
+        raise QCError("'root' is reserved (qc go root jumps to the project root).")
+    target = Path(args.dir).expanduser().resolve() if args.dir else Path.cwd().resolve()
+    if not target.is_dir():
+        raise QCError(f"not a directory: {target}")
+    data = project.load_commands()
+    action = "Updated" if args.name in data["paths"] else "Added"
+    data["paths"][args.name] = str(target)
+    project.save_commands(data)
+    print(f"{action} bookmark '{args.name}' -> {target}")
+
+
+def cmd_mark_rm(args):
+    project = current_project()
+    data = project.load_commands()
+    if args.name not in data["paths"]:
+        raise QCError(f"no bookmark '{args.name}' in project '{project.name}'."
+                      + did_you_mean(args.name, data["paths"]))
+    del data["paths"][args.name]
+    project.save_commands(data)
+    print(f"Removed bookmark '{args.name}'.")
+
+
+def cmd_go(args):
+    """Print the target directory on stdout (the shell function does the cd)."""
+    if not args.name:
+        return cmd_mark_ls(args)
+    project = current_project()
+    if args.name == "root":
+        target = project.root
+    else:
+        marks = project.load_commands()["paths"]
+        if args.name not in marks:
+            raise QCError(f"no bookmark '{args.name}' in project '{project.name}'."
+                          + did_you_mean(args.name, list(marks) + ["root"]))
+        target = Path(marks[args.name])
+        if not target.is_dir():
+            raise QCError(f"bookmarked directory no longer exists: {target}")
+    print(target)
+    if not os.environ.get("QC_SHELL") and sys.stdout.isatty():
+        note('to cd there directly, add  eval "$(qc shellrc)"  to your ~/.bashrc')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  data.yaml
+# ════════════════════════════════════════════════════════════════════════════
 
 DATA_TEMPLATE = """\
-# qc data.yaml — Datenquellen & Reaktionen für Thermochemie
-# Pfade relativ zum Projekt-Root oder absolut.
-# Pro Rolle ist eine Datei ODER eine Liste von Dateien erlaubt.
-# 'method:' überschreibt die METHOD-Spalte (nützlich, wenn dort None steht).
-
-# Quellen am besten mit 'qc data add <rolle> <csv> [-f <funktional>]' eintragen,
-# damit Zwischenergebnis-CSVs draußen bleiben. Rollen: thermo, sp, solv.
+# qc data.yaml - data sources and reactions for thermochemistry
+#
+# Paths are relative to the project root (or absolute). Each role takes one
+# file or a list of files; 'method:' / 'solvent:' override the METHOD / SOLVENT
+# column of that file (useful when it says None).
+# Add sources with:  qc data add <role> <file.csv> [-f <functional>] [-s <solvent>]
+#
+#   thermo  ENERGY + thermal corrections dU, dH, dG (Eh), e.g. optfreq jobs
+#   sp      ENERGY (Eh) of single points; several functionals allowed
+#   solv    Gsolv(Eh); several solvents allowed
+#   boltz   conformer ensembles (CENSO): G_LOW, G_AV
+#   bfreq   single-point (biased) Hessian thermal correction dG(Eh)
 sources:
-  thermo: null                     # dU/dH/dG (+ ENERGY als Fallback-Elektronik)
-  sp: null                         # elektronische Energien (mehrere Funktionale erlaubt)
-  solv: null                       # Gsolv(Eh), mehrere Lösemittel erlaubt
-  boltz: null                      # CENSO-Ensembles (G_LOW/G_AV)
-  bfreq: null                      # Single-Point-Hessian (dG(Eh))
-# Beispiel nach zwei 'qc data add sp ...':
+  thermo: null
+  sp: null
+  solv: null
+  boltz: null
+  bfreq: null
+# Example after two 'qc data add sp ...':
 #  sp:
 #    - {path: 2_sp/r2scan0/outorca.csv, method: r2scan0}
 #    - {path: 2_sp/pwpb95/outorca.csv, method: pwpb95}
 
-# NAME-Bestandteile (durch '.' getrennt), die bei der Basename-Bildung
-# an beliebiger Position entfernt werden. Tags wie .oet2 bleiben erhalten.
+# NAME parts that are dropped to get the species name: '.'-separated parts
+# anywhere, and trailing '_<part>'. 'a.oet2.optfreq' and 'a.oet2_censo' -> 'a.oet2'
 strip_suffixes: [optfreq, opt, freq, sp, solv, dock, censo, crest, conf, boltz, bfreq, sph]
 
 defaults:
-  unit: kcal/mol        # Einheit für Reaktionsenergien
-  temperature: 298.15   # K, für die Standard-State-Correction
-  solvation: false      # true = Gsolv immer mitnehmen (sonst nur mit -solv)
-  solvent: null         # Standard-Lösemittel, z.B. 1,2-dichloroethane (sonst -lm)
-  boltzmann: false      # true = Ensemble-Korrektur immer mitnehmen (sonst nur mit -boltz)
-  state_correction: false
-  method_sp: null       # Funktional der Hauptenergie, z.B. pwpb95 (sonst -f)
-  method_thermo: null   # Funktional der Thermokorrektur (darf abweichen!)
-  method_solv: null
+  unit: kcal/mol          # unit of reaction energies and scans
+  temperature: 298.15     # K, only used for the standard-state correction. Must match
+                          # the temperature of the frequency jobs: qc does not
+                          # rescale dU/dH/dG.
+  solvation: false        # true: always add Gsolv (otherwise only with --solv)
+  solvent: null           # default solvent, e.g. 1,2-dichloroethane
+  boltzmann: false        # true: always add the ensemble correction (otherwise --boltz)
+  bfreq: false            # true: G from the bfreq correction (otherwise --bfreq)
+  scan_bfreq: auto        # scans: auto = bfreq if it covers all points, else thermo
+  state_correction: false # true: always add 1 atm -> 1 M to G (otherwise --sc)
+  method_sp: null         # functional of the electronic energy (otherwise -f)
+  method_thermo: null     # functional of the thermal correction (otherwise --ft)
+  method_solv: null       # (otherwise --fsolv)
+  method_boltz: null      # (otherwise --fboltz)
+  method_bfreq: null      # (otherwise --fbfreq)
 
-# Plausibilitätsprüfungen beim Einlesen
+# Sanity checks when reading the data
 checks:
-  scf: true         # SCFCONV muss True sein
-  geoconv: false    # CPSCF/GEOCONV — bei OptFreq oft False trotz sauberer Geometrie
-  character: true   # CHAR passend zu IMAGS (MIN: 0, TS: 1)
+  scf: true         # SCFCONV must be True
+  geoconv: false    # CPSCF/GEOCONV must be True (often False for OptFreq jobs
+                    # with a converged geometry - CHAR/IMAGS is more reliable)
+  character: true   # CHAR must match IMAGS (MIN: 0, TS: 1 imaginary mode)
 
-# Wo liegen die Geometrien? {name} = Basename der Spezies.
-# Wird der Reihe nach probiert; danach sucht qc rekursiv nach <name>.xyz.
+# Where the geometries are ({name} = species name). Tried in this order;
+# afterwards qc searches the whole project for <name>.xyz.
 geometries:
   - xyz/{name}.xyz
   - 1_optfreq/{name}.xyz
   - "{name}.xyz"
 
-# Spalte der Single-Point-Hessian-Quelle (thermische Korrektur zu G)
+# Column of the bfreq source (thermal correction to G, Eh)
 bfreq_column: dG(Eh)
 
-# Spalten der CENSO-/Boltzmann-Quelle
+# Columns of the boltz source
 boltzmann_columns:
-  low: G_LOW            # G des tiefsten Konformers (Eh)
-  av: G_AV              # Boltzmann-gemitteltes G (Eh); Korrektur = av - low
-  check: dG_AV          # Gegenprobe in kcal/mol (nur Warnung bei Abweichung)
-#  value: dG_boltz      # alternativ: fertige Korrektur in Eh, dann low/av ignoriert
+  low: G_LOW            # G of the lowest conformer (Eh)
+  av: G_AV              # Boltzmann-averaged G (Eh); correction = av - low
+  check: dG_AV          # cross-check in kcal/mol (warning on mismatch)
+#  value: dG_boltz      # alternatively: the finished correction in Eh (low/av ignored)
 
-# Lösemittelnamen vereinheitlichen (CENSO schreibt oft anders als COSMOtherm)
+# Unify solvent names (CENSO and COSMOtherm often spell them differently)
 solvent_aliases: {}
 #  dichloroethane: 1,2-dichloroethane
-#  dcm: dichloromethane
 
+# Named reactions - manage with 'qc rxn add|rm|ls'
 reactions: {}
 #  deprot: "ni_h -> ni + h"
 #  dimer: "2 mono -> dimer"
 """
 
-QUANT_COLUMN = {"U": "dU", "H": "dH", "G": "dG"}
-COEFF_RE = re.compile(r"^(\d+(?:\.\d+)?)\s+(.+)$")
+
+def _roundtrip_yaml():
+    """ruamel.yaml keeps comments when data.yaml is rewritten; optional."""
+    try:
+        from ruamel.yaml import YAML
+    except ImportError:
+        return None
+    y = YAML()
+    y.preserve_quotes = True
+    y.indent(mapping=2, sequence=4, offset=2)
+    y.width = 100
+    y.representer.add_representer(
+        type(None), lambda r, _: r.represent_scalar("tag:yaml.org,2002:null", "null"))
+    return y
 
 
-def data_config_path(project_path):
-    return Path(project_path) / DATA_CONFIG_NAME
-
-
-def data_init():
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    target = data_config_path(project_path)
-    if target.exists():
-        print(f"[INFO] {target} existiert bereits — nichts überschrieben.")
-        return
-    target.write_text(DATA_TEMPLATE)
-    print(f"[OK] {target} erstellt (Projekt: {project_name}). Quellen eintragen!")
-
-
-def load_data_config(project_path):
+def _pyyaml():
     try:
         import yaml
     except ImportError:
-        print("Fehler: PyYAML nicht installiert (pip install pyyaml).", file=sys.stderr)
-        sys.exit(1)
-    cfg_file = data_config_path(project_path)
-    if not cfg_file.exists():
-        print(f"Fehler: Keine {DATA_CONFIG_NAME} im Projekt-Root gefunden.\n"
-              f"Erzeuge eine Vorlage mit 'qc data init'.", file=sys.stderr)
-        sys.exit(1)
-    with open(cfg_file) as f:
-        cfg = yaml.safe_load(f) or {}
-    cfg["sources"] = cfg.get("sources") or {}
-    cfg["strip_suffixes"] = cfg.get("strip_suffixes") or list(DEFAULT_STRIP_SUFFIXES)
-    cfg["defaults"] = cfg.get("defaults") or {}
-    cfg["defaults"].setdefault("unit", "kcal/mol")
-    cfg["defaults"].setdefault("temperature", 298.15)
-    cfg["defaults"].setdefault("state_correction", False)
-    cfg["defaults"].setdefault("solvation", False)
-    cfg["defaults"].setdefault("method_sp", None)
-    cfg["defaults"].setdefault("method_thermo", None)
-    cfg["defaults"].setdefault("method_solv", None)
-    cfg["defaults"].setdefault("solvent", None)
-    cfg["defaults"].setdefault("boltzmann", False)
-    cfg["defaults"].setdefault("method_boltz", None)
-    cfg["defaults"].setdefault("bfreq", False)
-    cfg.setdefault("bfreq_column", "dG(Eh)")
-    cfg["geometries"] = cfg.get("geometries") or ["xyz/{name}.xyz", "1_optfreq/{name}.xyz",
-                                                  "{name}.xyz"]
-    bc = cfg.get("boltzmann_columns") or {}
-    bc.setdefault("low", "G_LOW")
-    bc.setdefault("av", "G_AV")
-    cfg["boltzmann_columns"] = bc
-    cfg["solvent_aliases"] = cfg.get("solvent_aliases") or {}
-    cfg["reactions"] = cfg.get("reactions") or {}
-    cfg["checks"] = cfg.get("checks") or {}
-    cfg["checks"].setdefault("scf", True)
-    cfg["checks"].setdefault("geoconv", False)
-    cfg["checks"].setdefault("character", True)
+        raise QCError("PyYAML is required to read data.yaml (pip install pyyaml).")
+    return yaml
+
+
+def read_data_raw(project):
+    """data.yaml exactly as on disk (no defaults filled in)."""
+    f = project.data_file
+    if not f.exists():
+        raise QCError(f"no {DATA_FILE} in {project.root}.\n"
+                      f"Create a template with 'qc data init'.")
+    text = f.read_text(encoding="utf-8")
+    try:
+        rt = _roundtrip_yaml()
+        raw = rt.load(text) if rt else _pyyaml().safe_load(text)
+    except Exception as e:   # both YAML libraries have their own error hierarchies
+        raise QCError(f"{f} is not valid YAML:\n{e}")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise QCError(f"{f} must contain a mapping at the top level.")
+    return raw
+
+
+def write_data_raw(project, raw):
+    rt = _roundtrip_yaml()
+    if rt:
+        from io import StringIO
+        buf = StringIO()
+        rt.dump(raw, buf)
+        text = buf.getvalue()
+    else:   # PyYAML loses the comments
+        text = _pyyaml().safe_dump(_plain(raw), sort_keys=False, allow_unicode=True,
+                                   default_flow_style=False)
+    write_text_atomic(project.data_file, text)
+
+
+def _plain(obj):
+    """ruamel/PyYAML containers -> plain dicts/lists."""
+    if isinstance(obj, dict):
+        return {str(k): _plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_plain(v) for v in obj]
+    return obj
+
+
+def effective_config(raw):
+    """Copy of data.yaml with all defaults filled in (never written back)."""
+    raw = _plain(raw)
+    cfg = {
+        "sources": dict(raw.get("sources") or {}),
+        "strip_suffixes": [str(s).lower() for s in
+                           (raw.get("strip_suffixes") or DEFAULT_STRIP_SUFFIXES)],
+        "defaults": dict(DEFAULT_SETTINGS, **(raw.get("defaults") or {})),
+        "checks": dict(DEFAULT_CHECKS, **(raw.get("checks") or {})),
+        "geometries": list(raw.get("geometries") or DEFAULT_GEOMETRIES),
+        "bfreq_column": raw.get("bfreq_column") or "dG(Eh)",
+        "boltzmann_columns": dict({"low": "G_LOW", "av": "G_AV", "check": "dG_AV"},
+                                  **(raw.get("boltzmann_columns") or {})),
+        "solvent_aliases": {str(k).strip().lower(): str(v).strip().lower()
+                            for k, v in (raw.get("solvent_aliases") or {}).items()},
+        "reactions": {str(k): str(v) for k, v in (raw.get("reactions") or {}).items()},
+    }
     return cfg
 
 
+def load_data_config(project):
+    return effective_config(read_data_raw(project))
+
+
+def source_entries(value):
+    """Normalize a sources entry: 'path', ['a', 'b'], {path, method, solvent}, or mixed lists."""
+    if not value:
+        return []
+    items = value if isinstance(value, list) else [value]
+    out = []
+    for item in items:
+        if isinstance(item, dict):
+            if "path" not in item:
+                raise QCError(f"source entry without 'path' in {DATA_FILE}: {dict(item)}")
+            out.append({"path": str(item["path"]), "method": item.get("method"),
+                        "solvent": item.get("solvent")})
+        else:
+            out.append({"path": str(item), "method": None, "solvent": None})
+    return out
+
+
+def _dump_entries(entries):
+    def one(e):
+        extra = {k: e[k] for k in ("method", "solvent") if e.get(k)}
+        return dict(path=e["path"], **extra) if extra else e["path"]
+    if not entries:
+        return None
+    return one(entries[0]) if len(entries) == 1 else [one(e) for e in entries]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Loading the CSV data
+# ════════════════════════════════════════════════════════════════════════════
+
 def make_basename(name, strip):
     """
-    Bekannte Suffixe an beliebiger Stelle entfernen — sowohl punkt- als auch
-    unterstrich-getrennt ('a.oet2.optfreq' und 'a.oet2_censo' -> 'a.oet2').
+    Species name from a NAME entry: known suffixes are removed anywhere, both
+    '.'-separated and '_'-separated ('a.oet2.optfreq', 'a.oet2_censo' -> 'a.oet2').
     """
     def clean(part):
         while True:
@@ -497,315 +757,321 @@ def make_basename(name, strip):
             else:
                 return part
 
-    parts = [q for q in str(name).strip().split(".") if q.lower() not in strip]
+    parts = [p for p in str(name).strip().split(".") if p.lower() not in strip]
     if not parts:
         return str(name).strip()
-    return ".".join([parts[0]] + [clean(q) for q in parts[1:]]) if len(parts) > 1 else clean(parts[0])
+    if len(parts) == 1:
+        return clean(parts[0])
+    return ".".join([parts[0]] + [clean(p) for p in parts[1:]])
 
 
 def norm_method(value):
-    """'None'/leer -> None, sonst kleingeschriebener String."""
     s = str(value).strip().lower()
     return None if s in ("", "nan", "none", "null") else s
 
 
-def normalize_source_entries(value):
-    """Erlaubt: 'pfad', ['a','b'], {'path':..,'method':..}, [ {..}, 'pfad' ]."""
-    if not value:
-        return []
-    if isinstance(value, (str, Path)):
-        return [{"path": str(value), "method": None, "solvent": None}]
-    if isinstance(value, dict):
-        return [{"path": str(value["path"]), "method": value.get("method"),
-                 "solvent": value.get("solvent")}]
-    entries = []
-    for item in value:
-        if isinstance(item, dict):
-            entries.append({"path": str(item["path"]), "method": item.get("method"),
-                            "solvent": item.get("solvent")})
-        else:
-            entries.append({"path": str(item), "method": None, "solvent": None})
-    return entries
+def norm_solvent(value, aliases=None):
+    s = str(value).strip().lower()
+    if s in ("", "nan", "none", "null"):
+        return None
+    return (aliases or {}).get(s, s)
 
 
-def load_dataset(project_path, cfg):
+def resolve_path(project, path):
+    p = Path(path).expanduser()
+    return p if p.is_absolute() else project.root / p
+
+
+def read_csv(path):
     try:
         import pandas as pd
     except ImportError:
-        print("Fehler: pandas nicht installiert.", file=sys.stderr)
-        sys.exit(1)
-    strip = {str(x).lower() for x in cfg["strip_suffixes"]}
-    aliases = {str(k).strip().lower(): str(v).strip().lower()
-               for k, v in (cfg.get("solvent_aliases") or {}).items()}
+        raise QCError("pandas is required to read the data (pip install pandas).")
+    try:
+        df = pd.read_csv(path, sep=";")
+    except Exception as e:
+        raise QCError(f"cannot read {path}: {e}")
+    df.columns = [str(c).strip() for c in df.columns]
+    if "NAME" not in df.columns:
+        raise QCError(f"{path} has no NAME column (expected ';'-separated CSV).")
+    return df.rename(columns={"CHARGE": "CHRG", "MULTIPLICITY": "M"})
+
+
+def load_dataset(project, cfg, require=True):
+    """{role: DataFrame} with the added columns BASENAME, METHOD, SOLVENT, SOURCEFILE."""
+    import pandas as pd   # read_csv has already checked the import
+
+    strip = set(cfg["strip_suffixes"])
+    aliases = cfg["solvent_aliases"]
     data = {}
     for role in ROLES:
         frames = []
-        for entry in normalize_source_entries(cfg["sources"].get(role)):
-            path = Path(entry["path"])
-            if not path.is_absolute():
-                path = Path(project_path) / path
+        for entry in source_entries(cfg["sources"].get(role)):
+            path = resolve_path(project, entry["path"])
             if not path.exists():
-                print(f"[WARN] Quelle '{role}' nicht gefunden: {path}", file=sys.stderr)
+                warn(f"{role} source not found: {path}")
                 continue
-            df = pd.read_csv(path, sep=";")
-            df.columns = [str(c).strip() for c in df.columns]
-            df = df.rename(columns={"CHARGE": "CHRG", "MULTIPLICITY": "M"})
+            df = read_csv(path)
             df["BASENAME"] = df["NAME"].map(lambda n: make_basename(n, strip))
-            # METHOD: Spalte normalisieren, Eintrag aus der data.yaml hat Vorrang
-            if "METHOD" in df.columns:
-                df["METHOD"] = df["METHOD"].map(norm_method)
-            else:
-                df["METHOD"] = None
+            df["METHOD"] = df["METHOD"].map(norm_method) if "METHOD" in df.columns else None
             if entry["method"]:
                 df["METHOD"] = norm_method(entry["method"])
-            # SOLVENT: nur bei Solvatationsdaten relevant
             if "SOLVENT" in df.columns:
                 df["SOLVENT"] = df["SOLVENT"].map(lambda v: norm_solvent(v, aliases))
             else:
                 df["SOLVENT"] = None
-            if entry.get("solvent"):
+            if entry["solvent"]:
                 df["SOLVENT"] = norm_solvent(entry["solvent"], aliases)
             df["SOURCEFILE"] = str(path)
             frames.append(df)
         if frames:
             data[role] = pd.concat(frames, ignore_index=True)
-    if "thermo" not in data and "sp" not in data:
-        print("Fehler: Keine nutzbare Quelle (thermo/sp) in data.yaml konfiguriert/gefunden.",
-              file=sys.stderr)
-        sys.exit(1)
+    if require and "thermo" not in data and "sp" not in data:
+        raise QCError(f"no usable 'thermo' or 'sp' source in {DATA_FILE}.\n"
+                      f"Add one with 'qc data add <role> <file.csv>' "
+                      f"(or find candidates with 'qc data find').")
     return data
 
 
-def norm_solvent(value, aliases=None):
-    """Lösemittelname normalisieren: klein, ohne Randleerzeichen, Aliase aufgelöst."""
-    sv = str(value).strip().lower()
-    if sv in ("", "nan", "none", "null"):
-        return None
-    if aliases:
-        sv = aliases.get(sv, sv)
-    return sv
-
-
-def available_solvents(df):
-    vals = [v for v in df["SOLVENT"].unique() if v is not None]
-    return sorted(vals)
-
-
-def resolve_solvent(data, explicit, cfg_default, strict=True, aliases=None):
-    """Analog zu resolve_method, aber für die SOLVENT-Spalte der solv-Quelle."""
-    if "solv" not in data:
-        return None
-    solvents = available_solvents(data["solv"])
-    chosen = norm_solvent(explicit, aliases) if explicit else (
-        norm_solvent(cfg_default, aliases) if cfg_default else None)
-    if chosen is not None:
-        if chosen not in solvents:
-            avail = ", ".join(solvents) or "(keine)"
-            print(f"Fehler: Lösemittel '{chosen}' nicht in der solv-Quelle vorhanden. "
-                  f"Verfügbar: {avail}", file=sys.stderr)
-            sys.exit(1)
-        return chosen
-    if len(solvents) > 1:
-        if not strict:
-            return None
-        avail = ", ".join(solvents)
-        print(f"Fehler: Mehrere Lösemittel in der solv-Quelle vorhanden ({avail}).\n"
-              f"Reaktionen nur innerhalb eines Lösemittels — wähle mit -lm "
-              f"oder setze 'defaults: solvent:' in der data.yaml.", file=sys.stderr)
-        sys.exit(1)
-    return solvents[0] if solvents else None
+def elec_role(data):
+    """Role that provides the electronic energy: sp if present, else thermo."""
+    return "sp" if "sp" in data else "thermo"
 
 
 def available_methods(df):
-    """Sortierte Liste der in einer Quelle vorhandenen Methoden (None möglich)."""
     vals = list(df["METHOD"].unique())
     named = sorted(m for m in vals if m is not None)
     return named + ([None] if any(m is None for m in vals) else [])
 
 
-def resolve_method(data, role, explicit, cfg_default, label, strict=True):
+def available_solvents(df):
+    return sorted(v for v in df["SOLVENT"].unique() if v is not None)
+
+
+def resolve_method(data, role, explicit, default, flag, strict, setting=None):
     """
-    Legt die zu verwendende Methode für eine Rolle fest.
-    Reihenfolge: CLI-Flag > data.yaml > eindeutig vorhandene Methode.
-    strict=True  (Reaktionen): mehrere Methoden -> Fehler, denn alle Spezies
-                 müssen zwingend dasselbe Funktional benutzen.
-    strict=False (Einzelabfragen): mehrere Methoden -> None, die Auflösung
-                 passiert dann pro Spezies (eine Spezies hat oft nur eine).
+    Functional for one role: CLI flag > data.yaml default > the only one present.
+    strict=True (reactions, scans): several present -> error, since all species
+    must use the same functional. strict=False (single species): None, resolved
+    per species.
     """
     if role not in data:
         return None
     methods = available_methods(data[role])
-    chosen = norm_method(explicit) if explicit else (norm_method(cfg_default) if cfg_default else None)
+    chosen = norm_method(explicit) if explicit else norm_method(default) if default else None
     if chosen is not None:
         if chosen not in methods:
-            avail = ", ".join(str(m) for m in methods)
-            print(f"Fehler: Methode '{chosen}' nicht in Quelle '{role}' vorhanden. "
-                  f"Verfügbar: {avail}", file=sys.stderr)
-            sys.exit(1)
+            raise QCError(f"functional '{chosen}' not in the {role} source "
+                          f"(available: {', '.join(str(m) for m in methods)}).")
         return chosen
     if len(methods) > 1:
         if not strict:
             return None
-        avail = ", ".join(str(m) for m in methods)
-        print(f"Fehler: Mehrere Funktionale in Quelle '{role}' vorhanden ({avail}).\n"
-              f"Relative Energien nur bei gleichem Funktional — wähle mit {label} "
-              f"oder setze 'defaults' in der data.yaml.", file=sys.stderr)
-        sys.exit(1)
+        raise QCError(f"the {role} source holds several functionals "
+                      f"({', '.join(str(m) for m in methods)}).\n"
+                      f"Relative energies need one functional - choose with {flag} or set "
+                      f"'defaults: {setting or 'method_' + role}' in {DATA_FILE}.")
     return methods[0] if methods else None
 
 
+def resolve_solvent(data, explicit, default, strict, aliases):
+    if "solv" not in data:
+        if explicit:
+            raise QCError(f"--solvent given, but there is no solv source in {DATA_FILE}.")
+        return None
+    solvents = available_solvents(data["solv"])
+    chosen = norm_solvent(explicit, aliases) if explicit else (
+        norm_solvent(default, aliases) if default else None)
+    if chosen is not None:
+        if chosen not in solvents:
+            raise QCError(f"solvent '{chosen}' not in the solv source "
+                          f"(available: {', '.join(solvents) or '-'}).")
+        return chosen
+    if len(solvents) > 1:
+        if not strict:
+            return None
+        raise QCError(f"the solv source holds several solvents ({', '.join(solvents)}).\n"
+                      f"Compare species only within one solvent - choose with -s/--solvent "
+                      f"or set 'defaults: solvent' in {DATA_FILE}.")
+    return solvents[0] if solvents else None
+
+
 def parse_spec(spec):
-    """'name@3' -> ('name', 3); 'name' -> ('name', None)"""
-    if "@" in spec:
-        name, _, m = spec.rpartition("@")
-        if m.isdigit():
-            return name, int(m)
+    """'name@3' -> ('name', 3); 'name' -> ('name', None)."""
+    name, sep, m = spec.rpartition("@")
+    if sep and m.isdigit():
+        return name, int(m)
     return spec, None
 
 
-def pick_row(df, base, m, role, method=None, solvent=None):
+FUNCTIONAL_FLAG = {"sp": "-f", "thermo": "--ft", "solv": "--fsolv", "boltz": "--fboltz",
+                   "bfreq": "--fbfreq"}
+
+
+def pick_row(df, base, m, role, method=None, solvent=None, flag=None):
     hits = df[df["BASENAME"] == base]
     if m is not None and "M" in hits.columns:
         hits = hits[hits["M"].astype(float) == float(m)]
     if method is not None:
         hits = hits[hits["METHOD"] == method]
     if solvent is not None and hits["SOLVENT"].notna().any():
-        # Quellen ohne Lösemittelangabe (z.B. CENSO ohne SOLVENT-Spalte) nicht filtern
+        # sources without solvent information (e.g. CENSO without SOLVENT) are not filtered
         hits = hits[hits["SOLVENT"] == solvent]
     elif solvent is not None:
         solvent = None
     if len(hits) == 0:
-        desc = f"'{base}'"
-        if m is not None:
-            desc += f" (M={m})"
+        desc = f"'{base}'" + (f" (M={m})" if m is not None else "")
         if method is not None:
-            desc += f" mit Methode '{method}'"
+            desc += f" with functional '{method}'"
         if solvent is not None:
             desc += f" in '{solvent}'"
-        msg = f"{desc} nicht in Quelle '{role}' gefunden."
+        msg = f"{desc} not found in the {role} source."
         pool = df[df["BASENAME"] == base]
         if method is not None and len(pool):
-            have = ", ".join(str(x) for x in available_methods(pool))
-            msg += f"\nFür '{base}' vorhanden: {have}"
+            msg += f"\nAvailable for '{base}': {', '.join(str(x) for x in available_methods(pool))}"
         else:
-            matches = difflib.get_close_matches(base, list(df["BASENAME"].unique()), n=3, cutoff=0.5)
-            if matches:
-                msg += f"\nMeintest du: {', '.join(matches)}?"
+            msg += did_you_mean(base, df["BASENAME"].unique())
         raise LookupError(msg)
     if len(hits) > 1:
         if "M" in hits.columns and hits["M"].nunique() > 1:
-            ms = sorted(set(int(x) for x in hits["M"]))
-            raise LookupError(f"'{base}' ist mehrdeutig in Quelle '{role}' (M = {ms}).\n"
-                              f"Wähle die Multiplizität mit '{base}@M' oder -m.")
+            ms = sorted({int(x) for x in hits["M"]})
+            raise LookupError(f"'{base}' is ambiguous in the {role} source (M = {ms}).\n"
+                              f"Choose the multiplicity with '{base}@M' or -m.")
         if hits["METHOD"].nunique() > 1:
-            ms = ", ".join(str(x) for x in available_methods(hits))
-            raise LookupError(f"'{base}' liegt in Quelle '{role}' mit mehreren Funktionalen "
-                              f"vor ({ms}). Wähle eines mit -f.")
+            raise LookupError(f"'{base}' has several functionals in the {role} source "
+                              f"({', '.join(str(x) for x in available_methods(hits))}). "
+                              f"Choose one with {flag or FUNCTIONAL_FLAG[role]}.")
         if hits["SOLVENT"].nunique() > 1:
-            svs = ", ".join(available_solvents(hits))
-            raise LookupError(f"'{base}' liegt in Quelle '{role}' in mehreren Lösemitteln "
-                              f"vor ({svs}). Wähle eines mit -lm.")
-        print(f"[WARN] '{base}' kommt {len(hits)}x in Quelle '{role}' vor — nehme die erste Zeile.",
-              file=sys.stderr)
+            raise LookupError(f"'{base}' has several solvents in the {role} source "
+                              f"({', '.join(available_solvents(hits))}). Choose one with -s.")
+        warn(f"'{base}' occurs {len(hits)}x in the {role} source - using the first row.")
     return hits.iloc[0]
 
 
-def row_sanity_warnings(row, base, role, checks=None):
-    """
-    Plausibilitätsprüfung einer Zeile. 'checks' kommt aus data.yaml:
-      scf:       SCFCONV muss True sein
-      geoconv:   CPSCF/GEOCONV muss True sein (Default AUS — die Spalte ist bei
-                 OptFreq oft False, obwohl die Geometrie sauber konvergiert ist;
-                 CHAR/IMAGS ist der verlässlichere Indikator)
-      character: CHAR und IMAGS müssen zueinander passen
-    """
-    checks = checks or {}
+def _is_false(value):
+    return str(value).strip().lower() == "false"
 
-    def is_false(v):
-        return str(v).strip().lower() == "false"
 
-    if checks.get("scf", True) and is_false(row.get("SCFCONV")):
-        print(f"[WARN] {base} ({role}): SCF nicht konvergiert!", file=sys.stderr)
-
-    if checks.get("geoconv", False) and is_false(row.get("CPSCF/GEOCONV")):
-        print(f"[WARN] {base} ({role}): CPSCF/GEOCONV = False.", file=sys.stderr)
-
+def row_warnings(row, base, role, checks):
+    """Plausibility of one row (SCF convergence, character vs. imaginary modes)."""
+    if checks.get("scf", True) and _is_false(row.get("SCFCONV")):
+        warn(f"{base} ({role}): SCF not converged!")
+    if checks.get("geoconv", False) and _is_false(row.get("CPSCF/GEOCONV")):
+        warn(f"{base} ({role}): CPSCF/GEOCONV = False.")
     if not checks.get("character", True):
         return
-
     char = str(row.get("CHAR", "")).strip().upper()
     if char in ("", "NAN", "NONE"):
         return
-
-    imags = row.get("IMAGS")
-    s = str(imags).strip()
-    n_imag = None
-    if s not in ("", "nan", "None"):
-        try:
-            n_imag = int(float(s))
-        except (TypeError, ValueError):
-            n_imag = None
-    if n_imag is None:
-        n_imag = 0  # leere Spalte = keine imaginären Moden
-
+    try:
+        n_imag = int(float(str(row.get("IMAGS")).strip()))
+    except (TypeError, ValueError):
+        n_imag = 0   # empty column = no imaginary modes
     if char == "MIN" and n_imag > 0:
-        print(f"[WARN] {base} ({role}): als MIN geführt, aber {n_imag} imaginäre Mode(n)!",
-              file=sys.stderr)
+        warn(f"{base} ({role}): listed as MIN but has {n_imag} imaginary mode(s)!")
     elif char == "TS" and n_imag != 1:
-        print(f"[WARN] {base} ({role}): als TS geführt, aber {n_imag} imaginäre Mode(n)!",
-              file=sys.stderr)
+        warn(f"{base} ({role}): listed as TS but has {n_imag} imaginary mode(s)!")
     elif char not in ("MIN", "TS"):
-        print(f"[WARN] {base} ({role}): unbekannter Charakter '{char}'.", file=sys.stderr)
+        warn(f"{base} ({role}): unknown character '{char}'.")
 
 
-def boltz_sanity_warnings(row, base):
-    """CENSO-spezifische Plausibilitätsprüfungen."""
+def boltz_warnings(row, base):
     status = str(row.get("STATUS", "")).strip().upper()
     if status not in ("", "NAN", "NONE", "OK"):
-        print(f"[WARN] {base} (boltz): STATUS = {status}", file=sys.stderr)
+        warn(f"{base} (boltz): STATUS = {status}")
     try:
         failed = float(row.get("FAILED_CALC_COUNT", 0) or 0)
-        if failed > 0:
-            rel = row.get("FAILED_CALC_COUNT_REL")
-            extra = f" ({float(rel) * 100:.1f}%)" if rel not in (None, "", "nan") else ""
-            print(f"[WARN] {base} (boltz): {int(failed)} fehlgeschlagene Rechnungen{extra}",
-                  file=sys.stderr)
     except (TypeError, ValueError):
-        pass
+        return
+    if failed > 0:
+        rel = row.get("FAILED_CALC_COUNT_REL")
+        try:
+            extra = f" ({float(rel) * 100:.1f}%)"
+        except (TypeError, ValueError):
+            extra = ""
+        warn(f"{base} (boltz): {int(failed)} failed calculation(s){extra}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Thermochemistry
+# ════════════════════════════════════════════════════════════════════════════
+
+def unit_key(unit):
+    key = str(unit).strip().lower()
+    if key not in UNITS:
+        raise QCError(f"unknown unit '{unit}' (valid: Eh, kcal/mol, kJ/mol, eV).")
+    return key
+
+
+def fmt_energy(value_eh, unit, signed=False):
+    factor, label, decimals = UNITS[unit]
+    return f"{value_eh * factor:{'+' if signed else ''}.{decimals}f} {label}"
+
+
+def fmt_charge(q):
+    return f"{q:+d}" if q else "0"
 
 
 def state_correction_eh(temperature):
-    """Standard-State-Correction 1 atm (ideales Gas) -> 1 mol/L: RT ln(R'T)."""
-    return R_KCAL * temperature * math.log(0.0820573660809596 * temperature) / HARTREE_TO_KCAL
+    """Standard-state correction 1 atm (ideal gas) -> 1 mol/L: RT ln(R'T), in Eh."""
+    return R_KCAL * temperature * math.log(R_LATM * temperature) / HARTREE_TO_KCAL
 
 
-def species_value(data, cfg, spec, quantity, m_flag=None, sc=None, use_solv=None,
-                  methods=None, solvent=None, use_boltz=None, use_bfreq=None):
-    """Liefert (Wert in Eh, Breakdown-Dict) für eine Spezies wie 'name' oder 'name@M'."""
+class Settings:
+    """Everything that decides how a species energy is assembled."""
+
+    def __init__(self, **kw):
+        self.mult = kw.get("mult")
+        self.methods = kw.get("methods", {})
+        self.solvent = kw.get("solvent")
+        self.solv = kw.get("solv", False)
+        self.boltz = kw.get("boltz", False)
+        self.bfreq = kw.get("bfreq", False)
+        self.sc = kw.get("sc", False)
+        self.temperature = kw.get("temperature", 298.15)
+
+
+def resolve_settings(data, cfg, args, strict):
+    d = cfg["defaults"]
+    if args.solv is False and args.solvent:
+        raise QCError("--gas and --solvent contradict each other.")
+    solv = args.solv if args.solv is not None else (True if args.solvent
+                                                    else bool(d["solvation"]))
+    er = elec_role(data)
+    methods = {er: resolve_method(data, er, args.functional, d["method_sp"],
+                                  "-f/--functional", strict, setting="method_sp")}
+    for role, flag in (("thermo", "ft"), ("solv", "fsolv"), ("boltz", "fboltz"),
+                       ("bfreq", "fbfreq")):
+        if role != er:
+            methods[role] = resolve_method(data, role, getattr(args, flag),
+                                           d[f"method_{role}"], f"--{flag}", strict)
+    solvent = resolve_solvent(data, args.solvent, d["solvent"], strict and solv,
+                              cfg["solvent_aliases"])
+    return Settings(
+        mult=args.mult, methods=methods, solvent=solvent, solv=solv,
+        boltz=args.boltz if args.boltz is not None else bool(d["boltzmann"]),
+        bfreq=args.bfreq if args.bfreq is not None else bool(d["bfreq"]),
+        sc=args.sc if args.sc is not None else bool(d["state_correction"]),
+        temperature=float(d["temperature"]))
+
+
+def species_value(data, cfg, st, spec, quantity, bfreq=None):
+    """
+    Energy of one species ('name' or 'name@M') as a breakdown dict; 'total' in Eh.
+      total = E + thermal (dU/dH/dG or bfreq dG) + Gsolv + ensemble + standard state
+    Raises LookupError if a required entry is missing.
+    """
     base, m = parse_spec(spec)
     if m is None:
-        m = m_flag
-    methods = methods or {}
-    defaults = cfg["defaults"]
-    if sc is None:
-        sc = bool(defaults.get("state_correction", False))
-    if use_solv is None:
-        use_solv = bool(defaults.get("solvation", False))
-    if use_boltz is None:
-        use_boltz = bool(defaults.get("boltzmann", False))
-    if use_bfreq is None:
-        use_bfreq = bool(defaults.get("bfreq", False))
-    T = float(defaults.get("temperature", 298.15))
+        m = st.mult
+    use_bfreq = bool(st.bfreq if bfreq is None else bfreq)
+    bd = {"name": base, "M": m, "CHRG": None, "quantity": quantity}
 
-    bd = {"name": base, "M": m, "CHRG": None, "thermo_role": None}
-
-    # Elektronische Energie: sp-Quelle bevorzugt, sonst ENERGY aus thermo
-    elec_role = "sp" if "sp" in data else "thermo"
-    m_elec = methods.get(elec_role)
-    row_e = pick_row(data[elec_role], base, m, elec_role, method=m_elec)
-    row_sanity_warnings(row_e, base, elec_role, cfg["checks"])
-    E = float(row_e["ENERGY"])
-    bd["E"], bd["elec_role"], bd["method_sp"] = E, elec_role, row_e["METHOD"]
+    # electronic energy: sp source if present, else ENERGY of thermo
+    er = elec_role(data)
+    row_e = pick_row(data[er], base, m, er, method=st.methods.get(er), flag="-f")
+    row_warnings(row_e, base, er, cfg["checks"])
+    bd.update(E=float(row_e["ENERGY"]), elec_role=er, method_E=row_e["METHOD"])
     try:
         if bd["M"] is None:
             bd["M"] = int(float(row_e["M"]))
@@ -813,537 +1079,473 @@ def species_value(data, cfg, spec, quantity, m_flag=None, sc=None, use_solv=None
     except (KeyError, TypeError, ValueError):
         pass
 
-    # Thermische Korrektur (dU/dH/dG) — darf ein anderes Funktional sein
-    thermal = 0.0
-    bd["method_thermo"] = None
-    if quantity in QUANT_COLUMN and use_bfreq:
+    # thermal correction - may come from another functional than E
+    bd.update(thermal=0.0, thermal_role=None, method_thermal=None)
+    if quantity in QUANTITY_COLUMN and use_bfreq:
         if "bfreq" not in data:
-            raise LookupError("SPH-Korrektur angefordert (-bfreq), aber keine 'bfreq'-Quelle "
-                              "in der data.yaml eingetragen.")
+            raise LookupError(f"bfreq correction requested, but no bfreq source in {DATA_FILE}.")
         if quantity != "G":
-            raise LookupError(f"Die bfreq-Quelle liefert nur dG — {quantity} ist damit "
-                              f"nicht berechenbar (nutze -q G oder lass -bfreq weg).")
+            raise LookupError(f"the bfreq source only provides dG - {quantity} needs the "
+                              f"thermo source (use --no-bfreq).")
         col = cfg["bfreq_column"]
-        row_t = pick_row(data["bfreq"], base, m, "bfreq", method=methods.get("bfreq"))
+        row_t = pick_row(data["bfreq"], base, m, "bfreq", method=st.methods.get("bfreq"))
         if col not in row_t.index:
-            raise LookupError(f"Spalte '{col}' fehlt in der bfreq-Quelle. "
-                              f"Passe 'bfreq_column' in der data.yaml an.")
-        thermal = float(row_t[col])
-        bd["method_thermo"] = row_t["METHOD"]
-        bd["thermo_role"] = "bfreq"
-    elif quantity in QUANT_COLUMN:
+            raise LookupError(f"column '{col}' missing in the bfreq source "
+                              f"(set 'bfreq_column' in {DATA_FILE}).")
+        bd.update(thermal=float(row_t[col]), thermal_role="bfreq", method_thermal=row_t["METHOD"])
+    elif quantity in QUANTITY_COLUMN:
         if "thermo" not in data:
-            raise LookupError(f"{quantity} benötigt eine 'thermo'-Quelle in der data.yaml.")
-        if elec_role == "thermo":
+            raise LookupError(f"{quantity} needs a thermo source in {DATA_FILE}.")
+        if er == "thermo":
             row_t = row_e
         else:
-            row_t = pick_row(data["thermo"], base, m, "thermo", method=methods.get("thermo"))
-            row_sanity_warnings(row_t, base, "thermo", cfg["checks"])
-        thermal = float(row_t[QUANT_COLUMN[quantity]])
-        bd["method_thermo"] = row_t["METHOD"]
-        bd["thermo_role"] = "thermo"
-    bd["thermal"] = thermal
+            row_t = pick_row(data["thermo"], base, m, "thermo", method=st.methods.get("thermo"))
+            row_warnings(row_t, base, "thermo", cfg["checks"])
+        bd.update(thermal=float(row_t[QUANTITY_COLUMN[quantity]]), thermal_role="thermo",
+                  method_thermal=row_t["METHOD"])
 
-    # Solvatation — nur wenn ausdrücklich gewünscht (-solv bzw. defaults.solvation)
-    solv = 0.0
-    bd["method_solv"] = None
-    if use_solv:
+    # solvation
+    bd.update(solv=0.0, solvent=None, method_solv=None, gas=not st.solv)
+    if st.solv:
         if "solv" not in data:
-            raise LookupError("Solvatation angefordert (-solv), aber keine 'solv'-Quelle "
-                              "in der data.yaml eingetragen.")
-        row_s = pick_row(data["solv"], base, m, "solv", method=methods.get("solv"),
-                         solvent=solvent)
+            raise LookupError(f"solvation requested, but no solv source in {DATA_FILE}.")
+        row_s = pick_row(data["solv"], base, m, "solv", method=st.methods.get("solv"),
+                         solvent=st.solvent)
         col = "Gsolv(Eh)" if "Gsolv(Eh)" in row_s.index else "Gsolv"
         if col not in row_s.index:
-            raise LookupError("Keine 'Gsolv(Eh)'-Spalte in der solv-Quelle gefunden.")
-        solv = float(row_s[col])
-        bd["method_solv"] = row_s["METHOD"]
-        bd["solvent"] = row_s["SOLVENT"]
-    bd["solv"] = solv
-    bd["gas"] = not use_solv
-    bd.setdefault("solvent", None)
+            raise LookupError("no 'Gsolv(Eh)' column in the solv source.")
+        bd.update(solv=float(row_s[col]), solvent=row_s["SOLVENT"], method_solv=row_s["METHOD"])
 
-    # Boltzmann-/Ensemble-Korrektur (CENSO) — nur mit -boltz
-    boltz = 0.0
-    if use_boltz:
+    # conformer-ensemble correction (CENSO)
+    bd.update(boltz=0.0, method_boltz=None)
+    if st.boltz:
         if "boltz" not in data:
-            raise LookupError("Ensemble-Korrektur angefordert (-boltz), aber keine "
-                              "'boltz'-Quelle in der data.yaml eingetragen.")
+            raise LookupError(f"ensemble correction requested, but no boltz source in {DATA_FILE}.")
         bc = cfg["boltzmann_columns"]
-        row_b = pick_row(data["boltz"], base, m, "boltz", method=methods.get("boltz"),
-                         solvent=solvent if use_solv else None)
-        boltz_sanity_warnings(row_b, base)
+        row_b = pick_row(data["boltz"], base, m, "boltz", method=st.methods.get("boltz"),
+                         solvent=st.solvent if st.solv else None)
+        boltz_warnings(row_b, base)
         if bc.get("value") and bc["value"] in row_b.index:
             boltz = float(row_b[bc["value"]])
         else:
             for c in (bc["low"], bc["av"]):
                 if c not in row_b.index:
-                    raise LookupError(f"Spalte '{c}' fehlt in der boltz-Quelle. "
-                                      f"Passe 'boltzmann_columns' in der data.yaml an.")
+                    raise LookupError(f"column '{c}' missing in the boltz source "
+                                      f"(set 'boltzmann_columns' in {DATA_FILE}).")
             boltz = float(row_b[bc["av"]]) - float(row_b[bc["low"]])
-            # Gegenprobe gegen eine mitgelieferte kcal/mol-Spalte (z.B. dG_AV)
-            cross = bc.get("check", "dG_AV")
-            if cross in row_b.index:
+            cross = bc.get("check")
+            if cross and cross in row_b.index:
                 try:
                     ref = float(row_b[cross])
-                    if abs(boltz * HARTREE_TO_KCAL - ref) > 0.01:
-                        print(f"[WARN] {base} (boltz): {bc['av']}-{bc['low']} = "
-                              f"{boltz * HARTREE_TO_KCAL:.4f} kcal/mol passt nicht zu "
-                              f"{cross} = {ref:.4f}.", file=sys.stderr)
                 except (TypeError, ValueError):
-                    pass
-    bd["boltz"] = boltz
+                    ref = None
+                if ref is not None and abs(boltz * HARTREE_TO_KCAL - ref) > 0.01:
+                    warn(f"{base} (boltz): {bc['av']} - {bc['low']} = "
+                         f"{boltz * HARTREE_TO_KCAL:.4f} kcal/mol does not match "
+                         f"{cross} = {ref:.4f}.")
+        bd.update(boltz=boltz, method_boltz=row_b["METHOD"])
 
-    # Standard-State-Correction (nur für G)
-    state = state_correction_eh(T) if (quantity == "G" and sc) else 0.0
-    bd["state"] = state
+    # standard-state correction (only for G)
+    bd["state"] = state_correction_eh(st.temperature) if (quantity == "G" and st.sc) else 0.0
+    bd["temperature"] = st.temperature
+    bd["total"] = bd["E"] + bd["thermal"] + bd["solv"] + bd["boltz"] + bd["state"]
+    return bd
 
-    bd["total"] = E + thermal + solv + state + bd["boltz"]
-    return bd["total"], bd
 
-
-def print_breakdown(bd, quantity):
-    w = 34
-
-    def line(label, val):
-        print(f" {label:<{w}}{val:18.8f} Eh  {val * HARTREE_TO_KCAL:14.3f} kcal/mol")
-
-    mstr = f", M={bd['M']}" if bd["M"] is not None else ""
-    cstr = f", q={bd['CHRG']:+d}" if bd["CHRG"] is not None else ""
-    print(f"\n{quantity} für '{bd['name']}'{mstr}{cstr}:")
-    lab_e = f"Elektronische Energie ({bd['method_sp'] or bd['elec_role']}):"
-    line(lab_e, bd["E"])
-    if quantity in QUANT_COLUMN:
-        m_t = bd["method_thermo"]
-        src = "SPH" if bd.get("thermo_role") == "bfreq" else QUANT_COLUMN[quantity]
-        lab_t = f"Thermokorrektur {src}" + (f" ({m_t})" if m_t else "") + ":"
-        line(lab_t, bd["thermal"])
+def components(bd):
+    """[(key, label)] of the non-trivial contributions of a breakdown."""
+    q = bd["quantity"]
+    out = [("E", f"E ({bd['method_E'] or bd['elec_role']})")]
+    if bd["thermal_role"]:
+        src = "bfreq dG" if bd["thermal_role"] == "bfreq" else QUANTITY_COLUMN[q]
+        meth = f", {bd['method_thermal']}" if bd["method_thermal"] else ""
+        out.append(("thermal", f"thermal correction ({src}{meth})"))
     if not bd["gas"]:
-        parts = [p for p in (bd.get("solvent"), bd["method_solv"]) if p]
-        line("Solvatation (Gsolv" + (", " + ", ".join(parts) if parts else "") + "):", bd["solv"])
-    if bd.get("boltz"):
-        line("Ensemble-Korrektur (Boltzmann):", bd["boltz"])
+        parts = ", ".join(p for p in (bd["solvent"], bd["method_solv"]) if p)
+        out.append(("solv", "solvation (Gsolv" + (f", {parts}" if parts else "") + ")"))
+    if bd["boltz"]:
+        out.append(("boltz", "ensemble correction (G_AV - G_LOW)"))
     if bd["state"]:
-        line("Standard-State (1 atm -> 1 M):", bd["state"])
-    print(" " + "-" * (w + 40))
-    line("Summe:", bd["total"])
+        out.append(("state", f"standard state 1 atm -> 1 M ({bd['temperature']:g} K)"))
+    return out
 
 
-def format_value(val_eh, unit):
-    conv = UNIT_CONVERSION[unit]
-    fmt = ".8f" if conv == 1.0 else ".3f"
-    label = "Eh" if conv == 1.0 else unit
-    return f"{val_eh * conv:{fmt}} {label}"
+def describe(bd):
+    """Short provenance tag, e.g. 'E: pwpb95, thermo: wb97x-3c, solv: thf'."""
+    tags = []
+    if bd["method_E"]:
+        tags.append(f"E: {bd['method_E']}")
+    if bd["thermal_role"]:
+        meth = bd["method_thermal"] or "?"
+        tags.append(f"{'bfreq' if bd['thermal_role'] == 'bfreq' else 'thermo'}: {meth}")
+    tags.append("gas phase" if bd["gas"] else f"solv: {bd['solvent'] or bd['method_solv'] or '?'}")
+    if bd["boltz"]:
+        tags.append("ensemble")
+    if bd["state"]:
+        tags.append("1 M")
+    return ", ".join(tags)
 
 
-def check_unit(unit):
-    unit = unit.lower()
-    if unit not in UNIT_CONVERSION:
-        valid = ", ".join(UNIT_CONVERSION)
-        print(f"Fehler: Unbekannte Einheit '{unit}'. Gültig: {valid}", file=sys.stderr)
-        sys.exit(1)
-    return unit
+def print_breakdown(bd):
+    m = f"M = {bd['M']}" if bd["M"] is not None else ""
+    q = f"q = {fmt_charge(bd['CHRG'])}" if bd["CHRG"] is not None else ""
+    heading(f"{bd['quantity']} of {bd['name']}" + (f"  ({', '.join(p for p in (m, q) if p)})"
+                                                    if m or q else ""))
+    rows = [[label, f"{bd[key]:.8f} Eh", f"{bd[key] * HARTREE_TO_KCAL:.3f} kcal/mol"]
+            for key, label in components(bd)]
+    rows.append([bd["quantity"], f"{bd['total']:.8f} Eh",
+                 f"{bd['total'] * HARTREE_TO_KCAL:.3f} kcal/mol"])
+    width = max(len(r[0]) for r in rows)
+    for i, r in enumerate(rows):
+        if i == len(rows) - 1:
+            print("  " + "-" * (width + 40))
+        print(f"  {r[0]:<{width}}  {r[1]:>20}  {r[2]:>20}")
+    print()
 
 
-def parse_data_flags(rest):
-    opts = {"m": None, "sc": None, "v": False, "unit": None, "q": "G", "solv": None,
-            "f": None, "ft": None, "fsolv": None, "fboltz": None,
-            "boltz": None, "bfreq": None, "lm": None}
-    pos = []
-    i = 0
-    while i < len(rest):
-        a = rest[i]
-        if a in ("-sc", "--state-correction"):
-            opts["sc"] = True
-        elif a in ("-solv", "--solvation"):
-            opts["solv"] = True
-        elif a in ("-gas", "--gas"):
-            opts["solv"] = False
-        elif a in ("-boltz", "--boltzmann"):
-            opts["boltz"] = True
-        elif a in ("-bfreq", "--sph"):
-            opts["bfreq"] = True
-        elif a in ("-lm", "--solvent") and i + 1 < len(rest):
-            opts["lm"] = rest[i + 1]; i += 1
-        elif a in ("-v", "--verbose"):
-            opts["v"] = True
-        elif a == "-m" and i + 1 < len(rest):
-            opts["m"] = int(rest[i + 1]); i += 1
-        elif a in ("-f", "--functional") and i + 1 < len(rest):
-            opts["f"] = rest[i + 1]; i += 1
-        elif a in ("-ft", "--functional-thermo") and i + 1 < len(rest):
-            opts["ft"] = rest[i + 1]; i += 1
-        elif a in ("-fsolv", "--functional-solv") and i + 1 < len(rest):
-            opts["fsolv"] = rest[i + 1]; i += 1
-        elif a in ("-fboltz", "--functional-boltz") and i + 1 < len(rest):
-            opts["fboltz"] = rest[i + 1]; i += 1
-        elif a in ("-u", "--unit") and i + 1 < len(rest):
-            opts["unit"] = rest[i + 1]; i += 1
-        elif a == "-q" and i + 1 < len(rest):
-            opts["q"] = rest[i + 1].upper(); i += 1
-        else:
-            pos.append(a)
-        i += 1
-    return pos, opts
+def cmd_species(args):
+    project = current_project()
+    cfg = load_data_config(project)
+    data = load_dataset(project, cfg)
+
+    # one column per (role, functional, solvent), one row per (species, charge, multiplicity)
+    columns, cover = set(), {}
+    for role in ROLES:
+        if role not in data:
+            continue
+        df = data[role]
+        for _, row in df.iterrows():
+            col = (role, row["METHOD"] or "-", row["SOLVENT"] or "")
+            columns.add(col)
+            try:
+                q = int(float(row["CHRG"]))
+            except (KeyError, TypeError, ValueError):
+                q = None
+            try:
+                m = int(float(row["M"]))
+            except (KeyError, TypeError, ValueError):
+                m = None
+            cover.setdefault((row["BASENAME"], q, m), set()).add(col)
+    if args.pattern:
+        pat = args.pattern if any(c in args.pattern for c in "*?[") else f"*{args.pattern}*"
+        cover = {k: v for k, v in cover.items() if fnmatch.fnmatchcase(k[0], pat)}
+    if not cover:
+        print("No species found" + (f" matching '{args.pattern}'." if args.pattern else "."))
+        return
+    columns = sorted(columns, key=lambda c: (ROLES.index(c[0]), c[1], c[2]))
+    has_solvent_row = any(c[2] for c in columns)
+
+    def num(v):
+        return "?" if v is None else str(v)
+
+    header_rows = [["species", "q", "M"] + [c[0] if i == 0 or columns[i - 1][0] != c[0] else ""
+                                            for i, c in enumerate(columns)],
+                   ["", "", ""] + [c[1] for c in columns]]
+    if has_solvent_row:
+        header_rows.append(["", "", ""] + [c[2] for c in columns])
+    body = []
+    for key in sorted(cover, key=lambda k: (k[0], k[1] if k[1] is not None else 0,
+                                            k[2] if k[2] is not None else 0)):
+        base, q, m = key
+        body.append([base, num(q), num(m)] + ["x" if c in cover[key] else "." for c in columns])
+    widths = [max(len(r[i]) for r in header_rows + body) for i in range(len(body[0]))]
+
+    def line(r, center=True):
+        cells = [r[0].ljust(widths[0]), r[1].rjust(widths[1]), r[2].rjust(widths[2])]
+        cells += [c.center(w) if center else c.ljust(w) for c, w in zip(r[3:], widths[3:])]
+        return ("  " + "  ".join(cells)).rstrip()
+
+    heading(f"Species of '{project.name}' ({len(body)})")
+    for r in header_rows:
+        print(bold(line(r)))
+    for r in body:
+        print(line(r))
 
 
-def resolve_all_methods(data, cfg, opts, strict=True):
-    """
-    Legt die Funktionale für alle Rollen fest. Bei strict=True (Reaktionen) ist
-    damit garantiert, dass alle Hauptenergien vom selben Funktional stammen;
-    bei strict=False bleibt die Wahl offen und wird pro Spezies aufgelöst.
-    """
-    d = cfg["defaults"]
-    elec_role = "sp" if "sp" in data else "thermo"
-    methods = {elec_role: resolve_method(data, elec_role, opts["f"], d.get("method_sp"),
-                                         "-f", strict)}
-    if "thermo" in data and elec_role != "thermo":
-        methods["thermo"] = resolve_method(data, "thermo", opts["ft"], d.get("method_thermo"),
-                                           "-ft", strict)
-    if "solv" in data:
-        methods["solv"] = resolve_method(data, "solv", opts["fsolv"], d.get("method_solv"),
-                                         "-fsolv", strict)
-    if "boltz" in data:
-        methods["boltz"] = resolve_method(data, "boltz", opts["fboltz"],
-                                          d.get("method_boltz"), "-fboltz", strict)
-    if "bfreq" in data:
-        methods["bfreq"] = resolve_method(data, "bfreq", None, None, "-f", strict)
-    return methods
+def add_energy_args(p):
+    p.add_argument("species", nargs="+", metavar="SPECIES",
+                   help="species name; 'name@M' selects the multiplicity")
 
 
-def resolve_context(data, cfg, opts, strict=True):
-    """Funktionale + Lösemittel in einem Rutsch festlegen."""
-    methods = resolve_all_methods(data, cfg, opts, strict)
-    need_solv = opts["solv"] if opts["solv"] is not None else bool(cfg["defaults"].get("solvation"))
-    solvent = resolve_solvent(data, opts["lm"], cfg["defaults"].get("solvent"),
-                              strict and bool(need_solv),
-                              aliases={str(k).strip().lower(): str(v).strip().lower()
-                                       for k, v in (cfg.get("solvent_aliases") or {}).items()})
-    return methods, solvent
+def cmd_energy(args):
+    quantity = args.command.upper()
+    project = current_project()
+    cfg = load_data_config(project)
+    data = load_dataset(project, cfg)
+    unit = unit_key(args.unit or "eh")
+    st = resolve_settings(data, cfg, args, strict=False)
+    results = []
+    for spec in args.species:
+        try:
+            bd = species_value(data, cfg, st, spec, quantity)
+        except LookupError as e:
+            raise QCError(str(e))
+        results.append(bd)
+    if args.verbose:
+        for bd in results:
+            print_breakdown(bd)
+        return
+    width = max(len(f"{quantity}({bd['name']})") for bd in results)
+    for bd in results:
+        label = f"{quantity}({bd['name']})"
+        print(f"{label:<{width}} = {fmt_energy(bd['total'], unit):>22}   [{describe(bd)}]")
 
+
+# ── reactions ─────────────────────────────────────────────────────────────────
 
 def parse_reaction(eq):
+    """'a + 2 b -> c' -> ([(1.0, 'a'), (2.0, 'b')], [(1.0, 'c')])"""
     for arrow in ("->", "=>", "→", "="):
         if arrow in eq:
             left, right = eq.split(arrow, 1)
             break
     else:
-        raise ValueError(f"Keine Reaktionsgleichung erkennbar (kein '->'): {eq}")
+        raise QCError(f"not a reaction equation (no '->'): {eq}")
 
     def side(s):
+        # ' + ' with spaces separates species if present, so names may contain '+'
+        parts = re.split(r"\s\+\s", s) if re.search(r"\s\+\s", s) else s.split("+")
         terms = []
-        for t in s.split("+"):
-            t = t.strip()
-            if not t:
-                continue
-            mm = COEFF_RE.match(t)
-            terms.append((float(mm.group(1)), mm.group(2).strip()) if mm else (1.0, t))
+        for t in (p.strip() for p in parts):
+            if t:
+                mm = COEFF_RE.match(t)
+                terms.append((float(mm.group(1)), mm.group(2).strip()) if mm else (1.0, t))
         return terms
 
     reactants, products = side(left), side(right)
     if not reactants or not products:
-        raise ValueError(f"Unvollständige Reaktionsgleichung: {eq}")
+        raise QCError(f"incomplete reaction equation: {eq}")
     return reactants, products
 
 
-def cmd_energy(quantity, rest):
-    pos, opts = parse_data_flags(rest)
-    if not pos:
-        print(f"Verwendung: qc {quantity.lower()} <name> [name2 ...] [-m M] [-solv] [-sc] [-u unit] [-v]",
-              file=sys.stderr)
-        sys.exit(1)
-    config = load_global_config()
-    _, project_path, _ = require_project(config)
-    cfg = load_data_config(project_path)
-    data = load_dataset(project_path, cfg)
-    unit = check_unit(opts["unit"] or "hartree")
-    methods, solvent = resolve_context(data, cfg, opts, strict=False)
+def element_counts(atoms):
+    return Counter(a[0].capitalize() if a[0].isalpha() else a[0] for a in atoms)
 
-    for spec in pos:
+
+def check_atom_balance(project, cfg, details):
+    """Warn if the geometries show different atoms on both sides (skipped if any is missing)."""
+    finder = GeometryFinder(project.root, cfg)
+    total = Counter()
+    for nu, bd in details:
+        path = finder.find(bd["name"])
+        if path is None:
+            return None
         try:
-            val, bd = species_value(data, cfg, spec, quantity, m_flag=opts["m"],
-                                    sc=opts["sc"], use_solv=opts["solv"], methods=methods,
-                                    solvent=solvent, use_boltz=opts["boltz"],
-                                    use_bfreq=opts["bfreq"])
-        except (LookupError, ValueError) as e:
-            print(f"Fehler: {e}", file=sys.stderr)
-            sys.exit(1)
-        if opts["v"]:
-            print_breakdown(bd, quantity)
-        else:
-            tag = "" if bd["gas"] else f"(solv{', ' + bd['solvent'] if bd.get('solvent') else ''})"
-            extras = [x for x in (bd["method_sp"], "boltz" if bd.get("boltz") else None) if x]
-            mtag = f" [{', '.join(extras)}]" if extras else ""
-            print(f"{quantity}{tag}({bd['name']}) = {format_value(val, unit)}{mtag}")
+            counts = element_counts(read_xyz(path))
+        except (OSError, ValueError):
+            return None
+        for el, n in counts.items():
+            total[el] += nu * n
+    off = {el: n for el, n in total.items() if abs(n) > 1e-9}
+    if off:
+        diff = ", ".join(f"{el} {n:+g}" for el, n in sorted(off.items()))
+        warn(f"atoms are not balanced (products - reactants: {diff}) - check the stoichiometry.")
+        return False
+    return True
+
+
+def cmd_rxn(args):
+    words = args.words
+    if not words or words[0] == "ls":
+        return rxn_ls()
+    if words[0] == "add":
+        if len(words) < 3:
+            raise QCError('usage: qc rxn add <name> "<a + 2 b -> c>"')
+        return rxn_add(words[1], " ".join(words[2:]))
+    if words[0] == "rm":
+        if len(words) != 2:
+            raise QCError("usage: qc rxn rm <name>")
+        return rxn_rm(words[1])
+    return rxn_calc(args, " ".join(words))
+
+
+def rxn_ls():
+    project = current_project()
+    cfg = load_data_config(project)
+    heading(f"Reactions of '{project.name}'")
+    if not cfg["reactions"]:
+        print('  (none) - add one with: qc rxn add <name> "a + b -> c"')
+        return
+    print_table(sorted(cfg["reactions"].items()))
 
 
 def rxn_add(name, equation):
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    root = Path(project_path)
-    cfg = load_data_config(root)
-
-    if name in ("add", "rm", "list"):
-        print(f"Fehler: '{name}' ist ein reservierter Unterbefehl von 'qc rxn'.", file=sys.stderr)
-        sys.exit(1)
-    try:
-        reactants, products = parse_reaction(equation)
-    except ValueError as e:
-        print(f"Fehler: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Spezies gegen die Daten prüfen (nur warnen, nicht blockieren)
-    try:
-        data = load_dataset(root, cfg)
-        elec_role = "sp" if "sp" in data else "thermo"
-        known = set(data[elec_role]["BASENAME"])
+    project = current_project()
+    if name in ("add", "rm", "ls"):
+        raise QCError(f"'{name}' is reserved and cannot be a reaction name.")
+    reactants, products = parse_reaction(equation)
+    try:   # check the species against the data, but only warn
+        cfg = load_data_config(project)
+        data = load_dataset(project, cfg)
+        known = set(data[elec_role(data)]["BASENAME"])
         for _, spec in reactants + products:
-            base, _m = parse_spec(spec)
+            base, _ = parse_spec(spec)
             if base not in known:
-                print(f"[WARN] '{base}' ist in Quelle '{elec_role}' (noch) nicht vorhanden.",
-                      file=sys.stderr)
-    except SystemExit:
+                warn(f"'{base}' is not (yet) in the {elec_role(data)} source.")
+    except QCError:
         pass
-
-    action = "aktualisiert" if name in cfg["reactions"] else "hinzugefügt"
-    cfg["reactions"][name] = equation
-    write_data_config(root, cfg)
-    print(f"[OK] Reaktion '{name}' {action} (Projekt: {project_name}):")
-    print(f"     {equation}")
+    raw = read_data_raw(project)
+    if not isinstance(raw.get("reactions"), dict):
+        raw["reactions"] = {}
+    action = "Updated" if name in raw["reactions"] else "Added"
+    raw["reactions"][name] = equation
+    write_data_raw(project, raw)
+    print(f"{action} reaction '{name}': {equation}")
 
 
 def rxn_rm(name):
-    config = load_global_config()
-    _, project_path, _ = require_project(config)
-    root = Path(project_path)
-    cfg = load_data_config(root)
-    if name not in cfg["reactions"]:
-        print(f"Fehler: Reaktion '{name}' ist nicht definiert.", file=sys.stderr)
-        suggest(name, cfg["reactions"].keys())
-        sys.exit(1)
-    del cfg["reactions"][name]
-    write_data_config(root, cfg)
-    print(f"[OK] Reaktion '{name}' entfernt.")
+    project = current_project()
+    raw = read_data_raw(project)
+    reactions = raw.get("reactions") or {}
+    if name not in reactions:
+        raise QCError(f"no reaction '{name}'." + did_you_mean(name, reactions))
+    del reactions[name]
+    write_data_raw(project, raw)
+    print(f"Removed reaction '{name}'.")
 
 
-def rxn_list():
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    cfg = load_data_config(project_path)
-    print(f"--- Reaktionen in '{project_name}' ---")
-    if not cfg["reactions"]:
-        print(' (keine) — anlegen mit: qc rxn add <name> "a + b -> c"')
-        return
-    width = max(len(k) for k in cfg["reactions"])
-    for k, v in cfg["reactions"].items():
-        print(f" {k:<{width}}  {v}")
+def rxn_calc(args, key):
+    project = current_project()
+    cfg = load_data_config(project)
+    data = load_dataset(project, cfg)
+    quantity = args.quantity
+    unit = unit_key(args.unit or cfg["defaults"]["unit"])
+    st = resolve_settings(data, cfg, args, strict=True)
 
-
-def cmd_reaction(rest):
-    # Unterbefehle zur Verwaltung
-    if rest and rest[0] == "add":
-        args = rest[1:]
-        if len(args) < 2:
-            print('Verwendung: qc rxn add <name> "a + 2 b -> c"', file=sys.stderr)
-            sys.exit(1)
-        rxn_add(args[0], " ".join(args[1:]))
-        return
-    if rest and rest[0] == "rm":
-        if len(rest) < 2:
-            print("Verwendung: qc rxn rm <name>", file=sys.stderr)
-            sys.exit(1)
-        rxn_rm(rest[1])
-        return
-    if rest and rest[0] == "list":
-        rxn_list()
-        return
-
-    pos, opts = parse_data_flags(rest)
-    if not pos:
-        print('Verwendung: qc rxn "<a + b -> c>" | <definierter_name>  [-q E|U|H|G] [-solv] [-sc] [-u unit] [-v]',
-              file=sys.stderr)
-        sys.exit(1)
-    quantity = opts["q"]
-    if quantity not in ("E", "U", "H", "G"):
-        print(f"Fehler: -q muss E, U, H oder G sein (nicht '{quantity}').", file=sys.stderr)
-        sys.exit(1)
-
-    config = load_global_config()
-    _, project_path, _ = require_project(config)
-    cfg = load_data_config(project_path)
-    data = load_dataset(project_path, cfg)
-    unit = check_unit(opts["unit"] or cfg["defaults"]["unit"])
-    methods, solvent = resolve_context(data, cfg, opts, strict=True)
-
-    key = " ".join(pos)
+    name = key if key in cfg["reactions"] else None
     eq = cfg["reactions"].get(key, key)
     try:
         reactants, products = parse_reaction(eq)
-    except ValueError as e:
-        print(f"Fehler: {e}", file=sys.stderr)
-        if cfg["reactions"]:
-            print("Definierte Reaktionen:", ", ".join(cfg["reactions"]), file=sys.stderr)
-        sys.exit(1)
+    except QCError as e:
+        hint = f"\nNamed reactions: {', '.join(cfg['reactions'])}" if cfg["reactions"] else ""
+        raise QCError(f"'{key}' is neither a named reaction nor an equation.{hint}"
+                      + did_you_mean(key, cfg["reactions"])) from e
 
-    total = 0.0
-    charge = {-1: 0.0, +1: 0.0}
-    charge_ok = True
-    details = []
+    details = []   # (signed stoichiometric coefficient, breakdown)
     for sign, terms in ((-1, reactants), (+1, products)):
         for coeff, spec in terms:
             try:
-                val, bd = species_value(data, cfg, spec, quantity, sc=opts["sc"],
-                                        use_solv=opts["solv"], methods=methods,
-                                        solvent=solvent, use_boltz=opts["boltz"],
-                                    use_bfreq=opts["bfreq"])
-            except (LookupError, ValueError) as e:
-                print(f"Fehler: {e}", file=sys.stderr)
-                sys.exit(1)
-            total += sign * coeff * val
-            if bd["CHRG"] is None:
-                charge_ok = False
-            else:
-                charge[sign] += coeff * bd["CHRG"]
-            details.append((sign, coeff, bd))
+                details.append((sign * coeff, species_value(data, cfg, st, spec, quantity)))
+            except LookupError as e:
+                raise QCError(str(e))
 
-    if charge_ok and abs(charge[-1] - charge[+1]) > 1e-9:
-        print(f"[WARN] Ladungsbilanz verletzt: links {charge[-1]:g}, rechts {charge[+1]:g}!",
-              file=sys.stderr)
+    # consistency: same functional for E, one solvent, balanced charge and atoms
+    used_e = {bd["method_E"] for _, bd in details}
+    if len(used_e) > 1:
+        raise QCError(f"electronic energies from different functionals "
+                      f"({', '.join(sorted(map(str, used_e)))}) - relative energies would be "
+                      f"meaningless. Choose one with -f.")
+    used_solvents = {bd["solvent"] for _, bd in details if not bd["gas"]}
+    if len(used_solvents) > 1:
+        raise QCError(f"species in different solvents ({', '.join(sorted(map(str, used_solvents)))})"
+                      f" - choose one with -s.")
+    used_thermal = {(bd["thermal_role"], bd["method_thermal"]) for _, bd in details}
+    if len(used_thermal) > 1:
+        warn("thermal corrections from different functionals: "
+             + ", ".join(sorted(str(m) for _, m in used_thermal)))
+    charges = [(nu, bd["CHRG"]) for nu, bd in details]
+    if all(q is not None for _, q in charges):
+        dq = sum(nu * q for nu, q in charges)
+        if abs(dq) > 1e-9:
+            warn(f"charge is not balanced (products - reactants: {dq:+g}).")
+    check_atom_balance(project, cfg, details)
 
-    # Sicherheitsnetz: Hauptenergien müssen vom selben Funktional stammen
-    used_sp = {bd["method_sp"] for _, _, bd in details}
-    if len(used_sp) > 1:
-        print(f"Fehler: Hauptenergien stammen aus verschiedenen Funktionalen "
-              f"({', '.join(str(m) for m in sorted(used_sp, key=str))}) — "
-              f"relative Energien wären bedeutungslos. Wähle eines mit -f.", file=sys.stderr)
-        sys.exit(1)
-    used_lm = {bd.get("solvent") for _, _, bd in details if not bd["gas"]}
-    if len(used_lm) > 1:
-        print(f"Fehler: Spezies aus verschiedenen Lösemitteln "
-              f"({', '.join(str(x) for x in sorted(used_lm, key=str))}) — "
-              f"nicht vergleichbar. Wähle eines mit -lm.", file=sys.stderr)
-        sys.exit(1)
-    used_thermo = {bd["method_thermo"] for _, _, bd in details}
-    if len(used_thermo) > 1:
-        print(f"[WARN] Thermokorrekturen aus verschiedenen Funktionalen: "
-              f"{', '.join(str(m) for m in sorted(used_thermo, key=str))}", file=sys.stderr)
-
-    if opts["v"]:
-        print(f"\nReaktion: {eq}")
-        for sign, coeff, bd in details:
-            side = "Edukt  " if sign < 0 else "Produkt"
-            mstr = f"@{bd['M']}" if bd["M"] is not None else ""
-            print(f" {side}  {coeff:g} x {bd['name'] + mstr:<32} "
-                  f"{quantity} = {bd['total']:18.8f} Eh")
-        print(" " + "-" * 78)
-
-    lm0 = details[0][2].get("solvent")
-    tag = "" if details[0][2]["gas"] else f"(solv{', ' + lm0 if lm0 else ''})"
-    sc_used = any(bd["state"] for _, _, bd in details)
-    notes = []
-    m_sp = details[0][2]["method_sp"]
-    m_th = details[0][2]["method_thermo"]
-    if m_sp:
-        notes.append(f"E: {m_sp}")
-    if m_th and m_th != m_sp:
-        notes.append(f"thermo: {m_th}")
-    if any(bd.get("boltz") for _, _, bd in details):
-        notes.append("Boltzmann")
-    if sc_used:
-        notes.append("State-Corr.")
-    note_str = f"  [{', '.join(notes)}]" if notes else ""
-    print(f"d{quantity}{tag} = {format_value(total, unit)}{note_str}   ({eq})")
+    total = sum(nu * bd["total"] for nu, bd in details)
+    title = f"{name}: {eq}" if name else eq
+    if args.verbose:
+        print_reaction_breakdown(title, details, unit)
+    print(f"Δ{quantity} = {fmt_energy(total, unit)}   {title}   [{describe(details[0][1])}]")
 
 
-def cmd_species():
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    cfg = load_data_config(project_path)
-    data = load_dataset(project_path, cfg)
-
-    roles = [r for r in ROLES if r in data]
-    info = {}
-    for role in roles:
-        for _, row in data[role].iterrows():
-            entry = info.setdefault(row["BASENAME"],
-                                    {"roles": set(), "M": set(), "CHRG": set(),
-                                     "meth": set(), "lm": set()})
-            entry["roles"].add(role)
-            if row["METHOD"]:
-                entry["meth"].add(row["METHOD"])
-            if row.get("SOLVENT"):
-                entry["lm"].add(row["SOLVENT"])
-            for col, key in (("M", "M"), ("CHRG", "CHRG")):
-                try:
-                    entry[key].add(int(float(row[col])))
-                except (KeyError, TypeError, ValueError):
-                    pass
-
-    if not info:
-        print("Keine Spezies gefunden — sind die Quellen in der data.yaml korrekt?")
-        return
-
-    width = max([len(b) for b in info] + [len("SPEZIES")])
-    show_lm = any(e["lm"] for e in info.values())
-    header = (f" {'SPEZIES':<{width}}  {'q':>3} {'M':>3}  "
-              + "  ".join(f"{r:^6}" for r in roles) + "  METHODEN")
-    if show_lm:
-        header += "   LÖSEMITTEL"
-    print(f"--- Spezies in '{project_name}' ---")
-    print(header)
-    mwidth = max([len(", ".join(sorted(e["meth"]))) for e in info.values()] + [8])
-    for base in sorted(info):
-        e = info[base]
-        q = "/".join(str(x) for x in sorted(e["CHRG"])) or "?"
-        m = "/".join(str(x) for x in sorted(e["M"])) or "?"
-        cells = "  ".join(f"{'x' if r in e['roles'] else '-':^6}" for r in roles)
-        meth = ", ".join(sorted(e["meth"])) or "-"
-        row = f" {base:<{width}}  {q:>3} {m:>3}  {cells}  {meth:<{mwidth}}"
-        if show_lm:
-            row += "   " + (", ".join(sorted(e["lm"])) or "-")
-        print(row.rstrip())
+def print_reaction_breakdown(title, details, unit):
+    first = details[0][1]
+    keys = components(first)
+    heading(f"Reaction {title}")
+    short = {"E": "E", "thermal": "thermal", "solv": "Gsolv", "boltz": "ensemble",
+             "state": "std. state"}
+    header = ["ν", "species", "M", "q"] + [short[k] for k, _ in keys] + [first["quantity"]]
+    rows = []
+    for nu, bd in details:
+        rows.append([f"{nu:+g}", bd["name"], bd["M"] if bd["M"] is not None else "?",
+                     fmt_charge(bd["CHRG"]) if bd["CHRG"] is not None else "?"]
+                    + [f"{bd[k]:.8f}" for k, _ in keys] + [f"{bd['total']:.8f}"])
+    print_table(rows, header=header, align="rlrr" + "r" * (len(keys) + 1))
+    print(dim("  energies in Eh; ν < 0: reactants, ν > 0: products"))
+    print()
+    heading(f"Contributions ({UNITS[unit][1]})")
+    rows = []
+    for key, label in keys:
+        delta = sum(nu * bd[key] for nu, bd in details)
+        rows.append([f"Δ {label}", f"{delta * UNITS[unit][0]:+.{UNITS[unit][2]}f}"])
+    print_table(rows, align="lr")
+    print()
 
 
-# --- GEOMETRIEN & INTERNE KOORDINATEN ---
+# ════════════════════════════════════════════════════════════════════════════
+#  Geometries & internal coordinates
+# ════════════════════════════════════════════════════════════════════════════
 
 def read_xyz(path):
-    """XYZ-Datei lesen -> [(symbol, x, y, z), ...] in Angström."""
-    with open(path) as f:
+    """First frame of an XYZ file -> [(symbol, x, y, z), ...] in Angstrom."""
+    with open(path, encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
     try:
         n = int(lines[0].split()[0])
     except (IndexError, ValueError):
-        raise ValueError(f"Keine gültige XYZ-Datei: {path}")
+        raise ValueError(f"not a valid XYZ file: {path}")
     atoms = []
     for line in lines[2:2 + n]:
         parts = line.split()
-        if len(parts) < 4:
-            continue
-        atoms.append((parts[0], float(parts[1]), float(parts[2]), float(parts[3])))
+        if len(parts) >= 4:
+            atoms.append((parts[0], float(parts[1]), float(parts[2]), float(parts[3])))
     if len(atoms) != n:
-        raise ValueError(f"{path}: {len(atoms)} Atome gelesen, {n} erwartet.")
+        raise ValueError(f"{path}: read {len(atoms)} atoms, expected {n}.")
     return atoms
 
 
-def find_geometry(project_path, base, cfg):
-    """Geometriedatei zu einer Spezies suchen (Muster aus data.yaml, dann rekursiv)."""
-    root = Path(project_path)
-    for pattern in cfg["geometries"]:
-        cand = root / pattern.format(name=base)
-        if cand.exists():
-            return cand
-    hits = sorted(root.rglob(f"{base}.xyz"))
-    if hits:
-        return hits[0]
-    return None
+class GeometryFinder:
+    """Geometry of a species: the data.yaml patterns first, then a search of the project."""
+
+    def __init__(self, root, cfg):
+        self.root = Path(root)
+        self.patterns = cfg["geometries"]
+        self.strip = set(cfg["strip_suffixes"])
+        self._index = None
+
+    def find(self, base):
+        for pattern in self.patterns:
+            try:
+                cand = self.root / str(pattern).format(name=base)
+            except (KeyError, IndexError, ValueError):
+                continue
+            if cand.is_file():
+                return cand
+        hits = self.index().get(base)
+        return hits[0] if hits else None
+
+    def index(self):
+        """{name: [paths]} of all .xyz files: exact file stems first, then stripped names."""
+        if self._index is None:
+            exact, stripped = {}, {}
+            for p in sorted(self.root.rglob("*.xyz")):
+                rel = p.relative_to(self.root)
+                if any(part.startswith(".") for part in rel.parts) or p.stem.endswith("_trj"):
+                    continue
+                exact.setdefault(p.stem, []).append(p)
+                stripped.setdefault(make_basename(p.stem, self.strip), []).append(p)
+            self._index = {k: exact.get(k, []) + [p for p in v if p not in exact.get(k, [])]
+                           for k, v in stripped.items()}
+            for k, v in exact.items():
+                self._index.setdefault(k, v)
+        return self._index
 
 
-def _vec(a, b):
+def _sub(a, b):
     return (b[1] - a[1], b[2] - a[2], b[3] - a[3])
 
 
 def _dot(u, v):
-    return sum(x * y for x, y in zip(u, v))
+    return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
 
 
 def _cross(u, v):
@@ -1354,284 +1556,627 @@ def _norm(u):
     return math.sqrt(_dot(u, u))
 
 
-def internal_coordinate(atoms, kind, idx, one_based=True):
-    """
-    Interne Koordinate berechnen.
-      B i j       -> Bindungslänge in Angström
-      A i j k     -> Winkel in Grad (j = Scheitel)
-      D i j k l   -> Diederwinkel in Grad
-    """
-    kind = kind.upper()
-    need = {"B": 2, "A": 3, "D": 4}
-    if kind not in need:
-        raise ValueError(f"Unbekannter Koordinatentyp '{kind}' (erlaubt: B, A, D).")
-    if len(idx) != need[kind]:
-        raise ValueError(f"{kind} braucht {need[kind]} Atomindizes, {len(idx)} angegeben.")
+COORD_KINDS = {  # kind: (number of atoms, name, symbol, unit)
+    "B": (2, "bond length", "r", "Å"),
+    "A": (3, "angle", "θ", "°"),
+    "D": (4, "dihedral angle", "φ", "°"),
+}
 
-    pos = []
-    for i in idx:
-        j = i - 1 if one_based else i
-        if j < 0 or j >= len(atoms):
-            raise ValueError(f"Atomindex {i} liegt außerhalb (Molekül hat {len(atoms)} Atome).")
-        pos.append(atoms[j])
 
-    if kind == "B":
-        return _norm(_vec(pos[0], pos[1]))
-
-    if kind == "A":
-        u, v = _vec(pos[1], pos[0]), _vec(pos[1], pos[2])
-        c = _dot(u, v) / (_norm(u) * _norm(v))
-        return math.degrees(math.acos(max(-1.0, min(1.0, c))))
-
-    # Dieder nach der praxisüblichen atan2-Formulierung (vorzeichenrichtig)
-        # Signierter Diederwinkel nach IUPAC/Klyne-Prelog (-180..+180),
-    # gleiche Konvention wie ORCA, Molden und Avogadro:
-    #   phi = atan2( ((b1 x b2) x (b2 x b3)) . b2/|b2| ,  (b1 x b2) . (b2 x b3) )
-    b1 = _vec(pos[0], pos[1])
-    b2 = _vec(pos[1], pos[2])
-    b3 = _vec(pos[2], pos[3])
-    n1, n2 = _cross(b1, b2), _cross(b2, b3)
-    nb2 = _norm(b2)
-    if nb2 < 1e-10 or _norm(n1) < 1e-10 or _norm(n2) < 1e-10:
-        raise ValueError("Diederwinkel nicht definiert (kollineare Atome).")
-    x = _dot(n1, n2)
-    y = _dot(_cross(n1, n2), b2) / nb2
-    return math.degrees(math.atan2(y, x))
-
-def parse_coord_spec(tokens):
-    """['B','1','2'] -> ('B', [1, 2]); auch 'B,1,2' oder 'B 1 2' als ein Token."""
+def parse_coordinate(tokens):
+    """['B', '1', '2'], ['B,1,2'] or ['B 1 2'] -> ('B', [1, 2])"""
     flat = []
     for t in tokens:
         flat.extend(str(t).replace(",", " ").split())
     if not flat:
-        raise ValueError("Keine Koordinate angegeben (z.B. B 1 2, A 1 2 3, D 1 2 3 4).")
-    kind = flat[0]
+        raise QCError("no coordinate given (e.g. B 1 2, A 1 2 3, D 1 2 3 4).")
+    kind = flat[0].upper()
+    if kind not in COORD_KINDS:
+        raise QCError(f"unknown coordinate type '{flat[0]}' (B = bond, A = angle, D = dihedral).")
     try:
         idx = [int(x) for x in flat[1:]]
     except ValueError:
-        raise ValueError(f"Atomindizes müssen ganze Zahlen sein: {' '.join(flat[1:])}")
+        raise QCError(f"atom numbers must be integers: {' '.join(flat[1:])}")
+    if len(idx) != COORD_KINDS[kind][0]:
+        raise QCError(f"{kind} needs {COORD_KINDS[kind][0]} atom numbers, got {len(idx)}.")
     return kind, idx
 
 
-COORD_LABEL = {"B": ("Bindungslänge", "Å"), "A": ("Winkel", "°"), "D": ("Diederwinkel", "°")}
+def internal_coordinate(atoms, kind, idx, one_based=True):
+    """
+    B i j      bond length in Angstrom
+    A i j k    angle in degrees (j = apex)
+    D i j k l  dihedral in degrees, -180..180 (IUPAC sign convention, as ORCA/Avogadro)
+    """
+    kind = kind.upper()
+    pos = []
+    for i in idx:
+        j = i - 1 if one_based else i
+        if not 0 <= j < len(atoms):
+            raise ValueError(f"atom number {i} out of range ({len(atoms)} atoms, "
+                             f"{'1' if one_based else '0'}-based).")
+        pos.append(atoms[j])
+    if kind == "B":
+        return _norm(_sub(pos[0], pos[1]))
+    if kind == "A":
+        u, v = _sub(pos[1], pos[0]), _sub(pos[1], pos[2])
+        c = _dot(u, v) / (_norm(u) * _norm(v))
+        return math.degrees(math.acos(max(-1.0, min(1.0, c))))
+    # phi = atan2(((b1 x b2) x (b2 x b3)) . b2/|b2|, (b1 x b2) . (b2 x b3))
+    b1, b2, b3 = _sub(pos[0], pos[1]), _sub(pos[1], pos[2]), _sub(pos[2], pos[3])
+    n1, n2 = _cross(b1, b2), _cross(b2, b3)
+    if _norm(b2) < 1e-10 or _norm(n1) < 1e-10 or _norm(n2) < 1e-10:
+        raise ValueError("dihedral angle undefined (collinear atoms).")
+    return math.degrees(math.atan2(_dot(_cross(n1, n2), b2) / _norm(b2), _dot(n1, n2)))
 
 
-# --- HAUPT-CSVs IM HOME-VERZEICHNIS ---
+def coordinate_label(kind, idx, atoms=None, one_based=True, math_text=False):
+    """'r(Ni1–Br2) / Å' (atoms numbered as the user typed them)."""
+    def atom(i):
+        j = i - 1 if one_based else i
+        sym = atoms[j][0].capitalize() if atoms and 0 <= j < len(atoms) else ""
+        return f"{sym}{i}"
+    _, _, symbol, unit = COORD_KINDS[kind]
+    if math_text:
+        symbol = {"r": "$r$", "θ": r"$\theta$", "φ": r"$\varphi$"}[symbol]
+    return f"{symbol}({'–'.join(atom(i) for i in idx)}) / {unit}"
 
-MAIN_KEYS = ["PROJECT", "BASENAME", "M", "CHRG", "METHOD", "SOLVENT"]
+
+# ════════════════════════════════════════════════════════════════════════════
+#  PES scans
+# ════════════════════════════════════════════════════════════════════════════
+
+def scan_groups(data):
+    """{prefix: [(point, basename), ...]} for all species named <prefix>.<number>."""
+    groups = {}
+    names = set()
+    for df in data.values():
+        names.update(df["BASENAME"].tolist())
+    for b in names:
+        prefix, sep, tail = b.rpartition(".")
+        if sep and tail.isdigit():
+            groups.setdefault(prefix, []).append((int(tail), b))
+    for members in groups.values():
+        members.sort()
+    return groups
 
 
-def project_csv_path(project_name, role):
-    """Projekt-eigene Sammel-CSV, z.B. ~/.qc_data/vertiefer_demyan_main_sp.csv"""
-    safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(project_name))
-    return MAIN_DATA_DIR / f"{safe}_main_{role}.csv"
+def list_scans(project, data):
+    groups = scan_groups(data)
+    heading(f"Scans in '{project.name}'")
+    if not groups:
+        print("  (none) - scan points must be named <prefix>.<number>, e.g. mol_scan.1")
+        return
+    rows = [[p, len(m), f"{m[0][0]}–{m[-1][0]}"] for p, m in sorted(groups.items())]
+    print_table(rows, header=["prefix", "points", "numbers"], align="lrr")
+    print(dim("\n  qc scan <prefix> <B i j | A i j k | D i j k l>"))
 
 
-def _merge_into(target, df, subset):
-    """df in die CSV unter 'target' einpflegen (letzter Stand gewinnt)."""
-    import pandas as pd
-    if target.exists():
-        try:
-            old = pd.read_csv(target, sep=";")
-            old.columns = [str(c).strip() for c in old.columns]
-            merged = pd.concat([old, df], ignore_index=True)
-            merged = merged.drop_duplicates(subset=subset, keep="last")
-        except Exception as e:
-            print(f"[WARN] {target} nicht lesbar ({e}) — wird neu geschrieben.", file=sys.stderr)
-            merged = df
+def _scan_thermal(data, cfg, st, rows, quantity, explicit_bfreq):
+    """
+    Thermal quantity (G/H/U) of every scan point. One source for the whole curve:
+    bfreq is preferred for G (its frequencies are meaningful at non-stationary
+    points); thermo is the fallback. Returns (role, {point: breakdown}).
+    """
+    if quantity == "E":
+        return None, {}
+    if st.bfreq is True and quantity != "G":
+        raise QCError(f"the bfreq source only provides G - use -q G or --no-bfreq for {quantity}.")
+    if st.bfreq is True:
+        options = [True]
+    elif st.bfreq is False or quantity != "G":
+        options = [False]
     else:
-        merged = df
-    sort_cols = [c for c in ("PROJECT", "BASENAME", "METHOD", "SOLVENT") if c in merged.columns]
-    if sort_cols:
-        merged = merged.sort_values(by=sort_cols)
-    merged.to_csv(target, sep=";", index=False)
-    return len(merged)
-
-
-def update_main_csvs(project_name, project_path, cfg=None, roles=None, quiet=False):
-    """
-    Schreibt pro Rolle eine projekteigene Sammel-CSV:
-    ~/.qc_data/<projekt>_main_<rolle>.csv
-    Schlüssel: BASENAME + M + CHRG + METHOD + SOLVENT — jede Kombination steht
-    genau einmal drin, neue Einlesungen überschreiben den alten Stand.
-    """
-    try:
-        import pandas as pd  # noqa: F401
-    except ImportError:
-        return
-    cfg = cfg or load_data_config(project_path)
-    data = load_dataset(project_path, cfg)
-    MAIN_DATA_DIR.mkdir(exist_ok=True)
-
-    for role in (roles or ROLES):
+        options = [True, False]
+    results = {}
+    for use_bfreq in options:
+        role = "bfreq" if use_bfreq else "thermo"
         if role not in data:
+            if explicit_bfreq and use_bfreq:
+                raise QCError(f"--bfreq given, but there is no bfreq source in {DATA_FILE}.")
             continue
-        df = data[role].copy()
-        df.insert(0, "PROJECT", project_name)
-        for col in MAIN_KEYS:
-            if col not in df.columns:
-                df[col] = None
-
-        target = project_csv_path(project_name, role)
-        n = _merge_into(target, df, [k for k in MAIN_KEYS if k != "PROJECT"])
-        if not quiet:
-            print(f"[OK] {target}  ({n} Zeilen)")
-
-
-def cmd_main_update(all_projects=False):
-    config = load_global_config()
-    if all_projects:
-        if not config["projects"]:
-            print("Keine Projekte registriert.")
-            return
-        for name, path in config["projects"].items():
-            if not data_config_path(Path(path)).exists():
-                continue
-            print(f"--- {name} ---")
+        vals, errors = {}, {}
+        for r in rows:
             try:
-                update_main_csvs(name, Path(path))
-            except SystemExit:
-                print(f"[WARN] {name} übersprungen (Datenquellen unvollständig).",
-                      file=sys.stderr)
-        return
-    name, path, _ = require_project(config)
-    print(f"--- {name} ---")
-    update_main_csvs(name, path)
+                vals[r["point"]] = species_value(data, cfg, st, r["name"], quantity,
+                                                 bfreq=use_bfreq)
+            except LookupError as e:
+                errors[r["name"]] = str(e).splitlines()[0]
+        results[role] = (vals, errors)
+    if not results:
+        warn(f"no thermal data for {quantity} - showing E only.")
+        return None, {}
+
+    n = len(rows)
+    # complete coverage first, then more points; bfreq wins ties
+    order = sorted(results, key=lambda r: (len(results[r][0]) == n, len(results[r][0]),
+                                           r == "bfreq"), reverse=True)
+    role = order[0]
+    vals, errors = results[role]
+    if not vals:
+        warn(f"{quantity} not available for any scan point - showing E only.")
+        return None, {}
+    if role == "thermo" and "bfreq" in results:
+        note(f"bfreq covers only {len(results['bfreq'][0])}/{n} points - "
+             f"using the thermo correction for {quantity}.")
+    for name, why in sorted(errors.items()):
+        warn(f"{name}: no {quantity} ({why})")
+    return role, vals
 
 
-def cmd_main_show():
-    if not MAIN_DATA_DIR.exists():
-        print(f"Noch keine CSVs unter {MAIN_DATA_DIR}.")
-        return
-    try:
-        import pandas as pd
-    except ImportError:
-        pd = None
+def _unwrap_dihedrals(rows):
+    """Make dihedral angles continuous along the scan (e.g. 170, 180, 190 not -170)."""
+    prev = None
+    for r in sorted(rows, key=lambda r: r["point"]):
+        if prev is not None:
+            while r["x"] - prev > 180.0:
+                r["x"] -= 360.0
+            while r["x"] - prev < -180.0:
+                r["x"] += 360.0
+        prev = r["x"]
 
-    def describe(f):
-        if pd is None:
-            return ""
+
+def _bar(value, vmax, width=16):
+    if vmax <= 0 or value is None:
+        return ""
+    eighths = int(round(max(0.0, value) / vmax * width * 8))
+    return "█" * (eighths // 8) + ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")[eighths % 8]
+
+
+def cmd_scan(args):
+    project = current_project()
+    cfg = load_data_config(project)
+    data = load_dataset(project, cfg)
+    if not args.prefix:
+        return list_scans(project, data)
+    groups = scan_groups(data)
+    if args.prefix not in groups:
+        raise QCError(f"no scan points named '{args.prefix}.<number>'."
+                      + did_you_mean(args.prefix, groups)
+                      + ("\nList the scans with 'qc scan'." if groups else ""))
+    if not args.coordinate:
+        raise QCError(f"give the scan coordinate, e.g. 'qc scan {args.prefix} B 1 2'.")
+    kind, idx = parse_coordinate(args.coordinate)
+    one_based = not args.zero_based
+    unit = unit_key(args.unit or cfg["defaults"]["unit"])
+    st = resolve_settings(data, cfg, args, strict=True)
+    if args.bfreq is None:   # scans have their own default: None = auto
+        auto = str(cfg["defaults"]["scan_bfreq"]).strip().lower()
+        st.bfreq = None if auto in ("auto", "none", "null") else auto in ("true", "yes", "1")
+    members = groups[args.prefix]
+
+    finder = GeometryFinder(project.root, cfg)
+    rows, atoms0 = [], None
+    for point, name in members:
+        geo = finder.find(name)
+        if geo is None:
+            warn(f"{name}: no geometry found (see 'geometries' in {DATA_FILE}) - skipped.")
+            continue
         try:
-            df = pd.read_csv(f, sep=";")
-        except Exception:
-            return "  [nicht lesbar]"
-        meth = ", ".join(sorted({str(x) for x in df.get("METHOD", []) if str(x) != "nan"})) or "-"
-        out = f"{len(df):>5} Zeilen | Methoden: {meth}"
-        lms = sorted({str(x) for x in df.get("SOLVENT", []) if str(x) != "nan"})
-        if lms:
-            out += f" | Lösemittel: {', '.join(lms)}"
-        return out
+            atoms = read_xyz(geo)
+            x = internal_coordinate(atoms, kind, idx, one_based)
+            bd = species_value(data, cfg, st, name, "E", bfreq=False)
+        except (LookupError, ValueError, OSError) as e:
+            warn(f"{name} skipped: {str(e).splitlines()[0]}")
+            continue
+        atoms0 = atoms0 or atoms
+        rows.append({"point": point, "name": name, "x": x, "geometry": geo,
+                     "E": bd["total"], "E_bd": bd})
+    if not rows:
+        raise QCError("not a single scan point could be evaluated.")
+    if len(rows) < len(members):
+        warn(f"{len(members) - len(rows)} of {len(members)} points missing - the curve has gaps.")
 
-    files = sorted(MAIN_DATA_DIR.glob("*_main_*.csv"))
-    if not files:
-        print(f"Noch keine CSVs unter {MAIN_DATA_DIR}.")
-        return
+    q = args.quantity
+    role, thermal = _scan_thermal(data, cfg, st, rows, q, explicit_bfreq=args.bfreq is True)
+    quantities = ["E"] + ([q] if role else [])
+    if role:
+        for r in rows:
+            r[q] = thermal[r["point"]]["total"] if r["point"] in thermal else None
+    if kind == "D":
+        _unwrap_dihedrals(rows)
+    rows.sort(key=lambda r: (r["x"], r["point"]))
 
-    print(f"--- Projekt-CSVs in {MAIN_DATA_DIR} ---")
-    by_project = {}
-    for f in files:
-        for role in ROLES:
-            if f.stem.endswith(f"_main_{role}"):
-                by_project.setdefault(f.stem[: -len(f"_main_{role}")], []).append((role, f))
-                break
-    for proj in sorted(by_project):
-        print(f" [{proj}]")
-        for role, f in sorted(by_project[proj]):
-            print(f"   {role:<7} {describe(f)}")
+    factor = UNITS[unit][0]
+    for qq in quantities:
+        vals = [r[qq] for r in rows if r[qq] is not None]
+        lo = min(vals)
+        for r in rows:
+            r["d" + qq] = None if r[qq] is None else (r[qq] - lo) * factor
+
+    # provenance
+    bd0 = rows[0]["E_bd"]
+    info = [f"E: {bd0['method_E'] or bd0['elec_role']}"]
+    if role:
+        bdt = next(iter(thermal.values()))
+        src = "bfreq dG" if role == "bfreq" else QUANTITY_COLUMN[q]
+        info.append(f"{q} = E + {src} ({bdt['method_thermal'] or role})")
+    info.append("gas phase" if st.solv is False else f"solvation: {bd0['solvent'] or '?'}")
+    if st.boltz:
+        info.append("ensemble correction")
+    if st.sc and role and q == "G":
+        info.append("standard state 1 M")
+    xlabel = coordinate_label(kind, idx, atoms0, one_based)
+    dec_x = 4 if kind == "B" else 2
+    x_unit = " Å" if kind == "B" else "°"
+
+    heading(f"Scan {args.prefix}: {len(rows)} points along {xlabel}")
+    print(dim("  " + " · ".join(info)))
+    main_q = quantities[-1]
+    vmax = max(r["d" + main_q] for r in rows if r["d" + main_q] is not None)
+    unit_label = UNITS[unit][1]
+    header = ["point", xlabel] + [f"Δ{qq} / {unit_label}" for qq in quantities] + ["species", ""]
+    table = []
+    for r in rows:
+        cells = [r["point"], f"{r['x']:.{dec_x}f}"]
+        cells += ["-" if r["d" + qq] is None else f"{r['d' + qq]:.2f}" for qq in quantities]
+        cells += [r["name"], _bar(r["d" + main_q], vmax)]
+        table.append(cells)
+    print_table(table, header=header, align="rr" + "r" * len(quantities) + "ll")
+    print()
+    for qq in quantities:
+        avail = [r for r in rows if r["d" + qq] is not None]
+        top = max(avail, key=lambda r: r["d" + qq])
+        print(f"  max Δ{qq} = {top['d' + qq]:.2f} {unit_label} at {top['x']:.{dec_x}f}{x_unit} "
+              f"(point {top['point']}, relative to the scan minimum)")
+    if args.verbose:
+        print()
+        heading("Geometries")
+        print_table([[r["point"], r["geometry"]] for r in sorted(rows, key=lambda r: r["point"])],
+                    align="rl")
+
+    if args.csv:
+        write_scan_csv(args.csv, rows, quantities, unit)
+        print(f"Wrote {args.csv}")
+
+    if args.plot:
+        dataset = {
+            "label": args.label or args.prefix,
+            "coordinate": xlabel,
+            "info": " · ".join(info),
+            "points": [r["point"] for r in rows],
+            "x": [round(r["x"], 6) for r in rows],
+        }
+        for qq in quantities:
+            dataset[qq] = [None if r[qq] is None else round(r[qq], 8) for r in rows]
+        provenance = [f"Project:    {project.name}",
+                      f"Scan:       {args.prefix} ({len(rows)} points)",
+                      f"Coordinate: {xlabel} (atom numbers {'1' if one_based else '0'}-based)",
+                      f"Energies:   {' · '.join(info)}"]
+        settings = {"title": args.title or "",
+                    "xlabel": coordinate_label(kind, idx, atoms0, one_based, math_text=True),
+                    "unit": UNITS[unit][1] if unit not in ("eh", "hartree") else "Eh",
+                    "curves": list(reversed(quantities))}
+        for target in args.plot:
+            write_plot(Path(target), dataset, settings, provenance, append=args.append)
 
 
-def write_data_config(project_path, cfg):
-    """Schreibt die data.yaml zurück. Achtung: Kommentare gehen verloren."""
-    import yaml
-    with open(data_config_path(project_path), "w") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+def write_scan_csv(path, rows, quantities, unit):
+    tag = re.sub(r"\W+", "_", UNITS[unit][1]).upper()
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["POINT", "NAME", "X"] + [f"{q}_EH" for q in quantities]
+                   + [f"D{q}_{tag}" for q in quantities])
+        for r in rows:
+            w.writerow([r["point"], r["name"], f"{r['x']:.6f}"]
+                       + ["" if r[q] is None else f"{r[q]:.8f}" for q in quantities]
+                       + ["" if r["d" + q] is None else f"{r['d' + q]:.6f}" for q in quantities])
 
 
-def data_add_source(role, raw_path, method=None, solvent=None):
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    root = Path(project_path)
+# ── plot script ──────────────────────────────────────────────────────────────
 
-    if role not in ROLES:
-        print(f"Fehler: Rolle muss eine von {', '.join(ROLES)} sein (nicht '{role}').",
-              file=sys.stderr)
-        sys.exit(1)
+PLOT_DATA_BEGIN = "# >>> qc data (rewritten by 'qc scan --append'; keep this line)"
+PLOT_DATA_END = "# <<< qc data"
+PLOT_IMAGE_TYPES = (".png", ".pdf", ".svg", ".eps", ".jpg", ".jpeg", ".tif", ".tiff")
 
-    # Pfad auflösen: relativ zum cwd angegeben, gespeichert relativ zum Projekt-Root
-    abs_path = Path(raw_path).expanduser()
-    if not abs_path.is_absolute():
-        abs_path = (Path.cwd() / abs_path).resolve()
-    if not abs_path.exists():
-        print(f"Fehler: Datei existiert nicht: {abs_path}", file=sys.stderr)
-        sys.exit(1)
+PLOT_TEMPLATE = r'''#!/usr/bin/env python3
+"""
+Relaxed PES scan - generated by qc @VERSION@ on @STAMP@.
+
+@PROVENANCE@
+
+Edit the settings below and run:   python3 @FILENAME@
+Add another scan to this figure:   qc scan <prefix> <coordinate> --plot @FILENAME@ --append
+"""
+from bisect import bisect_right
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+
+# -- Settings -----------------------------------------------------------------
+@SETTINGS@
+
+# One color per dataset, in this order (colorblind-safe palette)
+COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+          "#e87ba4", "#008300", "#6250d6", "#e34948"]
+
+# -- Data ---------------------------------------------------------------------
+# Absolute energies in Eh; None: not available for that point.
+@DATA@
+
+# -- Plotting -----------------------------------------------------------------
+UNITS = {  # factor from Eh, axis label, decimals of the maximum label
+    "kcal/mol": (627.5094740631, "kcal mol$^{-1}$", 1),
+    "kj/mol": (2625.4996394799, "kJ mol$^{-1}$", 1),
+    "ev": (27.211386245988, "eV", 2),
+    "eh": (1.0, r"$E_\mathrm{h}$", 4),
+}
+SYMBOLS = {"E": r"$\Delta E$", "H": r"$\Delta H$", "U": r"$\Delta U$", "G": r"$\Delta G$"}
+LINESTYLES = ["-", (0, (4, 2)), (0, (1, 1.6))]
+INK, INK_MUTED, GRID = "#1f1f1f", "#6b6b6b", "#e6e6e6"
+STYLE = {
+    "font.size": 10, "axes.labelsize": 10, "axes.titlesize": 10,
+    "axes.edgecolor": "#9a9a9a", "axes.linewidth": 0.8, "axes.labelcolor": INK,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "axes.grid.axis": "y", "grid.color": GRID, "grid.linewidth": 0.6,
+    "xtick.color": INK_MUTED, "ytick.color": INK_MUTED, "text.color": INK,
+    "xtick.major.width": 0.8, "ytick.major.width": 0.8,
+    "legend.frameon": False, "legend.fontsize": 9,
+    "savefig.dpi": 300, "savefig.bbox": "tight", "savefig.facecolor": "white",
+}
+
+
+def curve(ds, quantity):
+    """(x, y) of one curve: sorted by x, relative to REFERENCE, in UNIT."""
+    factor = UNITS[UNIT.lower()][0]
+    pts = [(p, x, e) for p, x, e in zip(ds["points"], ds["x"], ds[quantity]) if e is not None]
+    if not pts:
+        return [], []
+    if REFERENCE == "min":
+        ref = min(e for _, _, e in pts)
+    else:
+        numbers = sorted(p for p, _, _ in pts)
+        want = {"first": numbers[0], "last": numbers[-1]}.get(REFERENCE, REFERENCE)
+        hits = [e for p, _, e in pts if p == want]
+        if not hits:
+            raise SystemExit(f"REFERENCE: point {want!r} has no {quantity} in '{ds['label']}'.")
+        ref = hits[0]
+    pts.sort(key=lambda t: t[1])
+    return [x for _, x, _ in pts], [(e - ref) * factor for _, _, e in pts]
+
+
+def pchip(x, y, n=400):
+    """
+    Monotone piecewise cubic Hermite interpolation (Fritsch-Carlson, as in SciPy).
+    Unlike a cubic spline it never overshoots: it adds no minima or maxima that
+    the computed points do not have.
+    """
+    h = [b - a for a, b in zip(x, x[1:])]
+    if len(x) < 3 or min(h) <= 0:
+        return x, y
+    d = [(y[i + 1] - y[i]) / h[i] for i in range(len(h))]
+    m = [0.0] * len(x)
+    for i in range(1, len(x) - 1):
+        if d[i - 1] * d[i] > 0:
+            w1, w2 = 2 * h[i] + h[i - 1], h[i] + 2 * h[i - 1]
+            m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i])
+    m[0] = end_slope(h[0], h[1], d[0], d[1])
+    m[-1] = end_slope(h[-1], h[-2], d[-1], d[-2])
+    xs, ys = [], []
+    for k in range(n):
+        t = x[0] + (x[-1] - x[0]) * k / (n - 1)
+        i = min(max(bisect_right(x, t) - 1, 0), len(h) - 1)
+        s = (t - x[i]) / h[i]
+        xs.append(t)
+        ys.append((2 * s**3 - 3 * s**2 + 1) * y[i] + (s**3 - 2 * s**2 + s) * h[i] * m[i]
+                  + (3 * s**2 - 2 * s**3) * y[i + 1] + (s**3 - s**2) * h[i] * m[i + 1])
+    return xs, ys
+
+
+def end_slope(h0, h1, d0, d1):
+    """Three-point end slope, limited so that the curve stays monotone."""
+    m = ((2 * h0 + h1) * d0 - h0 * d1) / (h0 + h1)
+    if m * d0 <= 0:
+        return 0.0
+    if d0 * d1 <= 0 and abs(m) > abs(3 * d0):
+        return 3 * d0
+    return m
+
+
+def main():
+    _, unit_label, decimals = UNITS[UNIT.lower()]
+    shown = [q for q in CURVES if any(q in ds for ds in DATASETS)]
+    with plt.rc_context(STYLE):
+        fig, ax = plt.subplots(figsize=FIGSIZE)
+        ax.set_axisbelow(True)
+        n_series = 0
+        for k, ds in enumerate(DATASETS):
+            color = COLORS[k % len(COLORS)]
+            for j, q in enumerate(shown):
+                x, y = curve(ds, q) if q in ds else ([], [])
+                if not x:
+                    continue
+                if len(DATASETS) == 1:
+                    label = SYMBOLS[q]
+                elif len(shown) == 1:
+                    label = ds["label"]
+                else:
+                    label = f"{ds['label']}, {SYMBOLS[q]}"
+                sx, sy = pchip(x, y) if SMOOTH else (x, y)
+                ax.plot(sx, sy, color=color, lw=1.6, ls=LINESTYLES[min(j, 2)], label=label,
+                        solid_capstyle="round", dash_capstyle="round", zorder=2)
+                primary = j == 0
+                ax.plot(x, y, ls="none", marker="o", ms=5.5 if primary else 4.5,
+                        mfc=color if primary else "white", mec="white" if primary else color,
+                        mew=1.0 if primary else 1.2, zorder=3)
+                n_series += 1
+                if ANNOTATE_MAX and primary:
+                    i = max(range(len(y)), key=y.__getitem__)
+                    ax.annotate(f"{y[i]:.{decimals}f}", (x[i], y[i]), xytext=(0, 7),
+                                textcoords="offset points", ha="center", va="bottom",
+                                fontsize=8.5, color=INK_MUTED)
+        if len(shown) == 1:
+            ax.set_ylabel(f"{SYMBOLS[shown[0]]} / {unit_label}")
+        else:
+            ax.set_ylabel(f"Relative energy / {unit_label}")
+        ax.set_xlabel(XLABEL)
+        if TITLE:
+            ax.set_title(TITLE, loc="left")
+        ax.margins(x=0.04, y=0.14)
+        ax.tick_params(length=3.5)
+        if n_series > 1:
+            ax.legend(loc="best", handlelength=2.6)
+        fig.tight_layout()
+        if OUTPUT:
+            here = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+            out = Path(OUTPUT) if Path(OUTPUT).is_absolute() else here / OUTPUT
+            fig.savefig(out)
+            print(f"Saved {out}")
+        if SHOW:
+            plt.show()
+        plt.close(fig)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _pystr(value):
+    """Python literal for the generated script: double quotes, raw string for LaTeX."""
+    if not isinstance(value, str):
+        return repr(value)
+    if "\\" in value and '"' not in value and not value.endswith("\\") and "\n" not in value:
+        return f'r"{value}"'
+    if '"' not in value and "\\" not in value and "\n" not in value:
+        return f'"{value}"'
+    return repr(value)
+
+
+def _settings_block(settings, output):
+    entries = [
+        ("TITLE", _pystr(settings["title"]), "plot title ('': none)"),
+        ("XLABEL", _pystr(settings["xlabel"]), ""),
+        ("UNIT", _pystr(settings["unit"]), '"kcal/mol", "kJ/mol", "eV" or "Eh"'),
+        ("CURVES", "[" + ", ".join(_pystr(c) for c in settings["curves"]) + "]",
+         "quantities to draw: 1st solid, 2nd dashed, 3rd dotted"),
+        ("REFERENCE", '"min"', '"min": every curve relative to its own minimum'),
+        ("", "", '"first" / "last": relative to the first / last scan point'),
+        ("", "", "12: relative to scan point 12"),
+        ("SMOOTH", "True", "monotone cubic (PCHIP) curve through the points"),
+        ("ANNOTATE_MAX", "True", "label the maximum of the first curve"),
+        ("FIGSIZE", "(5.0, 3.5)", "width, height in inches"),
+        ("OUTPUT", _pystr(output), ".png / .pdf / .svg next to this script; None: don't save"),
+        ("SHOW", "True", "open a window"),
+    ]
+    lines = []
+    for key, val, comment in entries:
+        left = f"{key} = {val}" if key else ""
+        left = left.ljust(30) if len(left) < 30 else left + "  "
+        lines.append((left + (f"# {comment}" if comment else "")).rstrip())
+    return "\n".join(lines)
+
+
+def _format_datasets(datasets):
+    lines = [PLOT_DATA_BEGIN, "DATASETS = ["]
+    for ds in datasets:
+        lines.append("    {")
+        for key, val in ds.items():
+            if not isinstance(val, list):
+                lines.append(f"        {_pystr(key)}: {_pystr(val)},")
+                continue
+            items = ", ".join(_pystr(v) for v in val)
+            if len(items) <= 72:
+                lines.append(f"        {_pystr(key)}: [{items}],")
+            else:
+                lines.append(f"        {_pystr(key)}: [")
+                lines.extend(textwrap.wrap(items + ",", width=96, initial_indent=" " * 12,
+                                           subsequent_indent=" " * 12, break_on_hyphens=False,
+                                           break_long_words=False))
+                lines.append("        ],")
+        lines.append("    },")
+    lines += ["]", PLOT_DATA_END]
+    return "\n".join(lines)
+
+
+def read_plot_datasets(path):
+    text = Path(path).read_text(encoding="utf-8")
+    begin, end = text.find(PLOT_DATA_BEGIN), text.find(PLOT_DATA_END)
+    if begin < 0 or end < begin:
+        raise QCError(f"{path} has no qc data block - can only append to scripts "
+                      f"written by 'qc scan --plot'.")
+    block = text[begin + len(PLOT_DATA_BEGIN):end]
     try:
-        stored = str(abs_path.relative_to(root.resolve()))
-    except ValueError:
-        stored = str(abs_path)  # außerhalb des Projekts -> absolut speichern
+        datasets = ast.literal_eval(block.split("=", 1)[1].strip())
+    except (ValueError, SyntaxError, IndexError) as e:
+        raise QCError(f"cannot read the DATASETS block of {path}: {e}")
+    return text, begin, end + len(PLOT_DATA_END), datasets
 
-    guess = classify_csv(abs_path)
-    if guess and guess != role:
-        print(f"[WARN] Header sieht eher nach Rolle '{guess}' aus als nach '{role}'.",
-              file=sys.stderr)
 
-    cfg = load_data_config(root)
-    entries = normalize_source_entries(cfg["sources"].get(role))
-    entries = [e for e in entries if e["path"] != stored]  # doppelte ersetzen
-    entries.append({"path": stored, "method": method, "solvent": solvent})
+def plot_script(name, datasets, settings, provenance, output):
+    fill = {
+        "@VERSION@": __version__,
+        "@STAMP@": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "@PROVENANCE@": "\n".join(provenance),
+        "@FILENAME@": name,
+        "@SETTINGS@": _settings_block(settings, output),
+        "@DATA@": _format_datasets(datasets),
+    }
+    text = PLOT_TEMPLATE
+    for key, val in fill.items():
+        text = text.replace(key, val)
+    return text
 
-    # Kompakt speichern: ohne Zusatzangaben als reiner String
-    def dump(e):
-        extra = {k: e.get(k) for k in ("method", "solvent") if e.get(k)}
-        return e["path"] if not extra else dict(path=e["path"], **extra)
 
-    cfg["sources"][role] = dump(entries[0]) if len(entries) == 1 else [dump(e) for e in entries]
-    write_data_config(root, cfg)
-    mstr = f" (method: {method})" if method else ""
-    print(f"[OK] {role} += {stored}{mstr}   (Projekt: {project_name})")
+def render_script(source, output):
+    """Run a plot script in-process (no window) and save the figure to 'output'."""
     try:
-        update_main_csvs(project_name, root, roles=[role], quiet=True)
-    except SystemExit:
-        pass
+        import matplotlib
+        matplotlib.use("Agg")
+    except ImportError:
+        raise QCError("matplotlib is required to render plots (pip install matplotlib).\n"
+                      "Alternatively write a script with --plot scan.py and run it elsewhere.")
+    namespace = {"__name__": "qc_plot"}
+    exec(compile(source, "<qc plot>", "exec"), namespace)
+    namespace["OUTPUT"] = str(Path(output).resolve())
+    namespace["SHOW"] = False
+    namespace["main"]()
 
 
-def data_rm_source(role, raw_path=None):
-    config = load_global_config()
-    _, project_path, _ = require_project(config)
-    root = Path(project_path)
-    cfg = load_data_config(root)
-    entries = normalize_source_entries(cfg["sources"].get(role))
-
-    if not entries:
-        print(f"Fehler: Für '{role}' ist nichts eingetragen.", file=sys.stderr)
-        sys.exit(1)
-
-    if raw_path is None:
-        cfg["sources"][role] = None
-        write_data_config(root, cfg)
-        print(f"[OK] Alle Quellen der Rolle '{role}' entfernt.")
+def write_plot(target, dataset, settings, provenance, append=False):
+    suffix = target.suffix.lower()
+    if suffix in PLOT_IMAGE_TYPES:
+        if append:
+            raise QCError("--append works with plot scripts (.py), not with images.")
+        source = plot_script(target.with_suffix(".py").name, [dataset], settings, provenance,
+                             target.name)
+        render_script(source, target)
         return
+    if suffix != ".py":
+        raise QCError(f"--plot: unknown file type '{target.suffix}' "
+                      f"(use .py for a script or {', '.join(PLOT_IMAGE_TYPES[:3])} for an image).")
+    if append and target.exists():
+        text, start, stop, datasets = read_plot_datasets(target)
+        coords = {ds.get("coordinate") for ds in datasets}
+        if dataset["coordinate"] not in coords:
+            warn(f"{target} plots {', '.join(sorted(map(str, coords)))}; the new scan is along "
+                 f"{dataset['coordinate']} - check XLABEL.")
+        labels = [ds.get("label") for ds in datasets]
+        if dataset["label"] in labels:
+            datasets[labels.index(dataset["label"])] = dataset
+            action = "Replaced"
+        else:
+            datasets.append(dataset)
+            action = "Added"
+        write_text_atomic(target, text[:start] + _format_datasets(datasets) + text[stop:])
+        print(f"{action} dataset '{dataset['label']}' in {target} ({len(datasets)} datasets)")
+        return
+    if append:
+        note(f"{target} does not exist yet - creating it.")
+    source = plot_script(target.name, [dataset], settings, provenance,
+                         target.with_suffix(".png").name)
+    write_text_atomic(target, source)
+    print(f"Wrote {target}  (run it with: python3 {target})")
 
-    target = str(raw_path)
-    keep = [e for e in entries if e["path"] != target and Path(e["path"]).name != target]
-    if len(keep) == len(entries):
-        print(f"Fehler: '{target}' ist bei '{role}' nicht eingetragen.", file=sys.stderr)
-        print("Eingetragen:", ", ".join(e["path"] for e in entries), file=sys.stderr)
-        sys.exit(1)
 
-    def dump(e):
-        extra = {k: e.get(k) for k in ("method", "solvent") if e.get(k)}
-        return e["path"] if not extra else dict(path=e["path"], **extra)
-
-    cfg["sources"][role] = None if not keep else (dump(keep[0]) if len(keep) == 1
-                                                  else [dump(e) for e in keep])
-    write_data_config(root, cfg)
-    print(f"[OK] '{target}' aus Rolle '{role}' entfernt.")
-
+# ════════════════════════════════════════════════════════════════════════════
+#  Data commands
+# ════════════════════════════════════════════════════════════════════════════
 
 def classify_csv(path):
-    """Rolle einer CSV am Header erkennen: solv > thermo > sp."""
+    """Guess the role of a CSV from its header."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             header = f.readline()
     except OSError:
         return None
@@ -1649,701 +2194,798 @@ def classify_csv(path):
     return None
 
 
-def data_scan(write=False):
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    root = Path(project_path)
+def cmd_data_init(args):
+    project = current_project()
+    if project.data_file.exists():
+        print(f"{project.data_file} already exists - nothing overwritten.")
+        return
+    project.data_file.write_text(DATA_TEMPLATE, encoding="utf-8")
+    print(f"Created {project.data_file}.\n"
+          f"Add sources with 'qc data add <role> <file.csv>' or 'qc data find'.")
 
-    found = {r: [] for r in ROLES}
+
+def cmd_data_ls(args):
+    project = current_project()
+    cfg = load_data_config(project)
+    data = load_dataset(project, cfg, require=False)
+    heading(f"Data sources of '{project.name}' ({DATA_FILE})")
+    rows = []
+    for role in ROLES:
+        entries = source_entries(cfg["sources"].get(role))
+        files = []
+        for e in entries:
+            extra = ", ".join(x for x in (e["method"], e["solvent"]) if x)
+            mark = "" if resolve_path(project, e["path"]).exists() else "  [missing]"
+            files.append(e["path"] + (f" [{extra}]" if extra else "") + mark)
+        if role in data:
+            df = data[role]
+            rows.append([role, len(df), ", ".join(str(m) for m in available_methods(df)),
+                         ", ".join(available_solvents(df)) or "-", "; ".join(files)])
+        else:
+            rows.append([role, "-", "-", "-", "; ".join(files) or "(not configured)"])
+    print_table(rows, header=["role", "rows", "functionals", "solvents", "files"],
+                align="lrlll")
+    if "thermo" not in data and "sp" not in data:
+        print("\nNo thermo/sp data yet - add a source with 'qc data add' or 'qc data find'.")
+
+
+def cmd_data_add(args):
+    project = current_project()
+    if args.role not in ROLES:
+        raise QCError(f"unknown role '{args.role}' (valid: {', '.join(ROLES)}).")
+    path = Path(args.file).expanduser()
+    path = path if path.is_absolute() else (Path.cwd() / path)
+    path = path.resolve()
+    if not path.is_file():
+        raise QCError(f"no such file: {path}")
+    try:
+        stored = str(path.relative_to(project.root.resolve()))
+    except ValueError:
+        stored = str(path)   # outside the project: store the absolute path
+    guess = classify_csv(path)
+    if guess and guess != args.role:
+        warn(f"the header looks like a '{guess}' source rather than '{args.role}'.")
+
+    raw = read_data_raw(project)
+    if not isinstance(raw.get("sources"), dict):
+        raw["sources"] = {}
+    entries = [e for e in source_entries(raw["sources"].get(args.role)) if e["path"] != stored]
+    entries.append({"path": stored, "method": args.functional, "solvent": args.solvent})
+    raw["sources"][args.role] = _dump_entries(entries)
+    write_data_raw(project, raw)
+    extra = ", ".join(x for x in (args.functional, args.solvent) if x)
+    print(f"Added {args.role} source {stored}" + (f" [{extra}]" if extra else ""))
+    try:
+        archive_project(project, load_data_config(project), roles=[args.role], quiet=True)
+    except QCError:
+        pass
+
+
+def cmd_data_rm(args):
+    project = current_project()
+    if args.role not in ROLES:
+        raise QCError(f"unknown role '{args.role}' (valid: {', '.join(ROLES)}).")
+    raw = read_data_raw(project)
+    sources = raw.get("sources") or {}
+    entries = source_entries(sources.get(args.role))
+    if not entries:
+        raise QCError(f"no {args.role} source configured.")
+    if args.file is None:
+        sources[args.role] = None
+        write_data_raw(project, raw)
+        print(f"Removed all {args.role} sources.")
+        return
+    keep = [e for e in entries if e["path"] != args.file and Path(e["path"]).name != args.file]
+    if len(keep) == len(entries):
+        raise QCError(f"'{args.file}' is not a {args.role} source.\n"
+                      f"Configured: {', '.join(e['path'] for e in entries)}")
+    sources[args.role] = _dump_entries(keep)
+    write_data_raw(project, raw)
+    print(f"Removed {args.file} from the {args.role} sources.")
+
+
+def cmd_data_find(args):
+    project = current_project()
+    root = project.root.resolve()
+    cfg = load_data_config(project) if project.data_file.exists() else effective_config({})
+    registered = {str(resolve_path(project, e["path"]).resolve())
+                  for role in ROLES for e in source_entries(cfg["sources"].get(role))}
+    found = []
     for path in sorted(root.rglob("*.csv")):
+        rel = path.relative_to(root)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
         role = classify_csv(path)
         if role:
-            found[role].append(str(path.relative_to(root)))
-
-    print(f"--- Gefundene CSVs in '{project_name}' ---")
-    if not any(found.values()):
-        print(" (keine) — erzeuge sie zuerst mit outorca in den Rechenordnern.")
+            found.append((role, str(rel), str(path.resolve()) in registered))
+    heading(f"Candidate CSV files in '{project.name}'")
+    if not found:
+        print("  (none) - create them first, e.g. with outorca in the calculation folders.")
         return
-    for role in ROLES:
-        for p in found[role]:
-            print(f" {role:<7} {p}")
-
-    if not write:
-        print("\nEinzeln übernehmen mit 'qc data add <rolle> <datei>' — "
-              "oder alle auf einmal mit 'qc data scan -w'.")
+    found.sort(key=lambda t: (ROLES.index(t[0]), t[1]))
+    print_table([[role, rel, "registered" if reg else "new"] for role, rel, reg in found])
+    new = [(role, rel) for role, rel, reg in found if not reg]
+    if not args.write:
+        if new:
+            print("\nAdd one with 'qc data add <role> <file>' or all new ones with "
+                  "'qc data find --write'.")
         return
-
-    import yaml
-    cfg_file = data_config_path(root)
-    cfg = load_data_config(root) if cfg_file.exists() else yaml.safe_load(DATA_TEMPLATE)
-    for role in ROLES:
-        paths = found[role]
-        cfg["sources"][role] = None if not paths else (paths[0] if len(paths) == 1 else paths)
-    write_data_config(root, cfg)
-    print(f"\n[OK] sources in {cfg_file} aktualisiert.")
-
-
-def cmd_data(rest):
-    sub = rest[0] if rest else "check"
-    if sub == "init":
-        data_init()
+    if not new:
+        print("\nNothing new to add.")
         return
-    if sub == "scan":
-        data_scan(write=("-w" in rest or "--write" in rest))
-        return
-    if sub == "add":
-        args, method, solvent = [], None, None
-        i = 1
-        while i < len(rest):
-            if rest[i] in ("-f", "--method", "--functional") and i + 1 < len(rest):
-                method = rest[i + 1]; i += 1
-            elif rest[i] in ("-lm", "--solvent") and i + 1 < len(rest):
-                solvent = rest[i + 1]; i += 1
-            else:
-                args.append(rest[i])
-            i += 1
-        if len(args) < 2:
-            print(f'Verwendung: qc data add <{"|".join(ROLES)}> <datei.csv> '
-                  f'[-f <funktional>] [-lm <lösemittel>]', file=sys.stderr)
-            sys.exit(1)
-        data_add_source(args[0], args[1], method, solvent)
-        return
-    if sub == "update":
-        cmd_main_update(all_projects=("-a" in rest or "--all" in rest))
-        return
-    if sub == "main":
-        cmd_main_show()
-        return
-    if sub == "rm":
-        args = [a for a in rest[1:]]
-        if not args:
-            print("Verwendung: qc data rm <thermo|sp|solv> [datei.csv]", file=sys.stderr)
-            sys.exit(1)
-        data_rm_source(args[0], args[1] if len(args) > 1 else None)
-        return
-    if sub not in ("check", "list"):
-        print("Verwendung: qc data init|add|rm|scan [-w]|check|update [-a]|main",
-              file=sys.stderr)
-        sys.exit(1)
+    if not project.data_file.exists():
+        project.data_file.write_text(DATA_TEMPLATE, encoding="utf-8")
+    raw = read_data_raw(project)
+    if not isinstance(raw.get("sources"), dict):
+        raw["sources"] = {}
+    for role, rel in new:
+        entries = source_entries(raw["sources"].get(role))
+        entries.append({"path": rel, "method": None, "solvent": None})
+        raw["sources"][role] = _dump_entries(entries)
+    write_data_raw(project, raw)
+    print(f"\nAdded {len(new)} source(s) to {DATA_FILE}.")
 
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    cfg = load_data_config(project_path)
-    data = load_dataset(project_path, cfg)
 
-    print(f"--- Datenlage in '{project_name}' ---")
-    for role in ROLES:
-        entries = normalize_source_entries(cfg["sources"].get(role))
-        if role in data:
-            meths = ", ".join(str(m) for m in available_methods(data[role]))
-            files = ", ".join(e["path"] for e in entries)
-            info = f"{len(data[role])} Zeilen, Methoden: {meths}"
-            lms = available_solvents(data[role])
-            if lms:
-                info += f", Lösemittel: {', '.join(lms)}"
-            print(f" {role:<7} {files}  ({info})")
-        elif entries:
-            print(f" {role:<7} {', '.join(e['path'] for e in entries)}  [NICHT GEFUNDEN]")
-        else:
-            print(f" {role:<7} (nicht konfiguriert)")
+def cmd_data_check(args):
+    project = current_project()
+    cfg = load_data_config(project)
+    cmd_data_ls(args)
+    data = load_dataset(project, cfg)
+    print()
+    heading("Checks")
+    before = len(_WARNINGS_SEEN)
 
-    # Sanity-Checks über alle Zeilen
-    print("\nPrüfe Konvergenz/Charakter aller Einträge ...")
-    for role in ("thermo", "sp"):
-        if role in data:
-            for _, row in data[role].iterrows():
-                row_sanity_warnings(row, row["BASENAME"], role, cfg["checks"])
-
-    # Duplikate (gleiche Spezies, gleiche M UND gleiche Methode)
+    # convergence and character of every row
     for role, df in data.items():
-        keys = ["BASENAME", "METHOD"] + (["M"] if "M" in df.columns else [])
+        for _, row in df.iterrows():
+            row_warnings(row, row["BASENAME"], role, cfg["checks"])
+            if role == "boltz":
+                boltz_warnings(row, row["BASENAME"])
+
+    # duplicates: same species, multiplicity, functional and solvent
+    for role, df in data.items():
+        keys = ["BASENAME", "METHOD", "SOLVENT"] + (["M"] if "M" in df.columns else [])
         dup = df[df.duplicated(subset=keys, keep=False)]
         for base in sorted(dup["BASENAME"].unique()):
-            print(f"[WARN] Duplikat in '{role}': {base}", file=sys.stderr)
+            warn(f"duplicate entries in {role}: {base}")
 
-    # Solvatations-Abdeckung
+    # coverage of thermo and of every solvent
+    er = elec_role(data)
+    species = set(data[er]["BASENAME"])
+
+    def report(what, missing):
+        if missing:
+            names = sorted(missing)
+            more = f" (+{len(names) - 8} more)" if len(names) > 8 else ""
+            warn(f"{what} missing for {len(names)} species: {', '.join(names[:8])}{more}")
+
+    if er == "sp" and "thermo" in data:
+        report("thermo", species - set(data["thermo"]["BASENAME"]))
     if "solv" in data:
-        elec_role = "sp" if "sp" in data else "thermo"
-        missing = set(data[elec_role]["BASENAME"]) - set(data["solv"]["BASENAME"])
-        for base in sorted(missing):
-            print(f"[WARN] Keine Solvatation für: {base}", file=sys.stderr)
-    print("Fertig.")
+        df = data["solv"]
+        for solvent in available_solvents(df) or [None]:
+            sub = df if solvent is None else df[df["SOLVENT"] == solvent]
+            report(f"Gsolv ({solvent})" if solvent else "Gsolv",
+                   species - set(sub["BASENAME"]))
+
+    # solvent names of boltz that the solv source does not know (spelling differs?)
+    if "boltz" in data and "solv" in data:
+        known = set(available_solvents(data["solv"]))
+        for solvent in available_solvents(data["boltz"]):
+            if solvent not in known:
+                warn(f"boltz solvent '{solvent}' does not occur in the solv source "
+                     f"({', '.join(sorted(known)) or '-'}) - add it to 'solvent_aliases'?")
+
+    # charge consistency across sources
+    charges = {}
+    for role, df in data.items():
+        if "CHRG" in df.columns:
+            for base, q in zip(df["BASENAME"], df["CHRG"]):
+                try:
+                    charges.setdefault(base, set()).add(int(float(q)))
+                except (TypeError, ValueError):
+                    pass
+    for base, qs in sorted(charges.items()):
+        if len(qs) > 1:
+            warn(f"{base} appears with different charges ({', '.join(map(str, sorted(qs)))}).")
+
+    n = len(_WARNINGS_SEEN) - before
+    print(f"  {n} warning(s)." if n else "  All checks passed.")
 
 
-# --- STATUS / EDIT / HISTORY ---
+def cmd_data_edit(args):
+    project = current_project()
+    if not project.data_file.exists():
+        project.data_file.write_text(DATA_TEMPLATE, encoding="utf-8")
+    return open_in_editor(project.data_file)
 
-def show_status():
-    config = load_global_config()
-    name, path, is_local = detect_current_project(config)
-    if not name:
-        print("Kein Projekt erkannt und kein aktives Projekt gesetzt.")
+
+# ── archive (~/.qc_data) ──────────────────────────────────────────────────────
+
+ARCHIVE_KEYS = ["PROJECT", "BASENAME", "M", "CHRG", "METHOD", "SOLVENT"]
+
+
+def archive_path(project_name, role):
+    """~/.qc_data/<project>_main_<role>.csv"""
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(project_name))
+    return ARCHIVE_DIR / f"{safe}_main_{role}.csv"
+
+
+def _merge_into(target, df, subset):
+    """Merge df into the CSV 'target'; for identical keys the new row wins."""
+    import pandas as pd
+    merged = df
+    if target.exists():
+        try:
+            old = pd.read_csv(target, sep=";")
+            old.columns = [str(c).strip() for c in old.columns]
+            merged = pd.concat([old, df], ignore_index=True)
+            merged = merged.drop_duplicates(subset=subset, keep="last")
+        except Exception as e:
+            warn(f"{target} is unreadable ({e}) - rewriting it.")
+    sort_cols = [c for c in ("PROJECT", "BASENAME", "METHOD", "SOLVENT") if c in merged.columns]
+    if sort_cols:
+        merged = merged.sort_values(by=sort_cols)
+    merged.to_csv(target, sep=";", index=False)
+    return len(merged)
+
+
+def archive_project(project, cfg, roles=None, quiet=False):
+    """
+    Collect all data of a project per role into ~/.qc_data/<project>_main_<role>.csv.
+    Key: BASENAME + M + CHRG + METHOD + SOLVENT - every combination appears once,
+    re-reading overwrites the old values; entries whose source CSV is gone are kept.
+    """
+    data = load_dataset(project, cfg)
+    ARCHIVE_DIR.mkdir(exist_ok=True)
+    for role in roles or ROLES:
+        if role not in data:
+            continue
+        df = data[role].copy()
+        df.insert(0, "PROJECT", project.name)
+        for col in ARCHIVE_KEYS:
+            if col not in df.columns:
+                df[col] = None
+        target = archive_path(project.name, role)
+        n = _merge_into(target, df, [k for k in ARCHIVE_KEYS if k != "PROJECT"])
+        if not quiet:
+            print(f"  {role:<7} {target}  ({n} rows)")
+
+
+def cmd_data_archive(args):
+    if args.list:
+        return archive_list()
+    if args.all:
+        reg = load_registry()
+        for name, path in sorted(reg["projects"].items()):
+            project = Project(name, path, here=False)
+            if not project.data_file.exists():
+                continue
+            heading(name)
+            try:
+                archive_project(project, load_data_config(project))
+            except QCError as e:
+                warn(f"{name} skipped: {str(e).splitlines()[0]}")
         return
-    mode = "automatisch erkannt (cwd)" if is_local else "global aktiv (Remote-Modus)"
-    print(f"Projekt : {name}  [{mode}]")
-    print(f"Root    : {path}")
-    pcfg = load_project_config(path)
-    print(f"Shortcuts: {', '.join(pcfg['commands']) or '(keine)'}")
-    print(f"Bookmarks: {', '.join(pcfg['paths']) or '(keine)'}")
+    project = current_project()
+    heading(f"Archiving '{project.name}' to {ARCHIVE_DIR}")
+    archive_project(project, load_data_config(project))
 
 
-def edit_config():
-    config = load_global_config()
-    _, project_path, _ = require_project(config)
-    editor = os.environ.get("EDITOR", "vi")
-    subprocess.run([editor, str(project_config_path(project_path))])
-
-
-def show_history(n=15):
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    hist = Path(project_path) / HISTORY_NAME
-    if not hist.exists():
-        print(f"Noch keine History in Projekt '{project_name}'.")
+def archive_list():
+    files = sorted(ARCHIVE_DIR.glob("*_main_*.csv")) if ARCHIVE_DIR.exists() else []
+    if not files:
+        print(f"No archive files in {ARCHIVE_DIR} yet ('qc data archive' creates them).")
         return
-    lines = hist.read_text().splitlines()
-    print(f"--- Letzte {min(n, len(lines))} Befehle in '{project_name}' ---")
-    for line in lines[-n:]:
-        print(" " + line)
-
-
-def log_history(project_path, full_cmd):
     try:
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        with open(Path(project_path) / HISTORY_NAME, "a") as f:
-            f.write(f"{stamp}  [{os.getcwd()}]  {full_cmd}\n")
-    except OSError:
-        pass  # History ist nice-to-have, darf nie den Lauf verhindern
+        import pandas as pd
+    except ImportError:
+        pd = None
+    heading(f"Archive {ARCHIVE_DIR}")
+    rows = []
+    for f in files:
+        project, _, role = f.stem.rpartition("_main_")
+        if role not in ROLES:
+            continue
+        if pd is None:
+            rows.append([project, role, "?", "", ""])
+            continue
+        try:
+            df = pd.read_csv(f, sep=";")
+        except Exception:
+            rows.append([project, role, "unreadable", "", ""])
+            continue
+        meths = sorted({str(x) for x in df.get("METHOD", []) if str(x) != "nan"})
+        solvents = sorted({str(x) for x in df.get("SOLVENT", []) if str(x) != "nan"})
+        rows.append([project, role, len(df), ", ".join(meths) or "-", ", ".join(solvents) or "-"])
+    print_table(rows, header=["project", "role", "rows", "functionals", "solvents"], align="llr")
 
 
-# --- SHELL-INTEGRATION ---
+# ════════════════════════════════════════════════════════════════════════════
+#  Shell integration & completion
+# ════════════════════════════════════════════════════════════════════════════
 
-SHELL_FUNC = r'''
-# qc Shell-Wrapper: macht 'qc go <mark>' zu einem echten cd
+SHELL_TEMPLATE = r'''# qc shell integration (bash/zsh): cd for 'qc go', tab completion
+unalias qc 2>/dev/null
+_qc_exec() { @EXEC@ "$@"; }
 qc() {
-    if [ "$1" = "go" ] && [ "$#" -ge 2 ]; then
-        local _qc_target
-        _qc_target="$(command qc go "$2")" && cd "$_qc_target"
+    if [ "$1" = "go" ] && [ "$#" -ge 2 ] && [ "${2#-}" = "$2" ]; then
+        local _qc_dir
+        _qc_dir="$(QC_SHELL=1 _qc_exec go "$2")" && cd -- "$_qc_dir"
     else
-        command qc "$@"
+        _qc_exec "$@"
     fi
 }
+_qc_complete() {
+    local IFS=$'\n'
+    COMPREPLY=($(_qc_exec __complete "$COMP_CWORD" "${COMP_WORDS[@]}" 2>/dev/null))
+}
+if [ -n "$ZSH_VERSION" ]; then
+    autoload -U +X bashcompinit 2>/dev/null && bashcompinit
+fi
+complete -o default -F _qc_complete qc
 '''
 
 
-def print_shellrc():
-    print(SHELL_FUNC.strip())
+def cmd_shellrc(args):
+    exe = f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))}"
+    print(SHELL_TEMPLATE.replace("@EXEC@", exe).rstrip())
 
 
-# --- AUSFÜHRUNG ---
-
-def run_calc_command(shortcut, extra_args, print_only=False):
-    config = load_global_config()
-    project_name, project_path, is_local = require_project(config)
-
-    if not is_local and not print_only:
-        print(f"[Remote-Modus] Nutze Config von Projekt: {project_name}", file=sys.stderr)
-
-    pcfg = load_project_config(project_path)
-    commands = pcfg["commands"]
-
-    if shortcut not in commands:
-        print(f"Fehler: Shortcut '{shortcut}' nicht in Projekt '{project_name}' definiert.",
-              file=sys.stderr)
-        print("Verfügbare Shortcuts:", ", ".join(commands.keys()) or "(keine)", file=sys.stderr)
-        suggest(shortcut, commands.keys())
-        sys.exit(1)
-
-    base_cmd = commands[shortcut]
-    full_cmd = f"{base_cmd} {' '.join(extra_args)}".strip() if extra_args else base_cmd
-
-    if print_only:
-        # Nur den Befehl auf stdout — direkt kopierbar / pipebar
-        print(full_cmd)
-        return
-
-    print(f"> {full_cmd}")
-    try:
-        subprocess.run(full_cmd, cwd=os.getcwd(), shell=True, check=True)
-        log_history(project_path, full_cmd)
-    except subprocess.CalledProcessError as e:
-        print(f"Fehler bei der Ausführung: {e}", file=sys.stderr)
-        sys.exit(e.returncode)
+def _complete_species(include_scans=False):
+    """Species names from the data sources, read cheaply without pandas."""
+    project = find_project()
+    if not project or not project.data_file.exists():
+        return []
+    cfg = load_data_config(project)
+    strip = set(cfg["strip_suffixes"])
+    names = set()
+    for role in ROLES:
+        for e in source_entries(cfg["sources"].get(role)):
+            path = resolve_path(project, e["path"])
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    for row in csv.DictReader(f, delimiter=";"):
+                        n = (row.get("NAME") or "").strip()
+                        if n:
+                            names.add(make_basename(n, strip))
+            except OSError:
+                continue
+    if include_scans:
+        return sorted({n.rpartition(".")[0] for n in names
+                       if n.rpartition(".")[2].isdigit() and "." in n})
+    return sorted(names)
 
 
-# --- PES-SCANS ---
-
-PLOT_TEMPLATE = """#!/usr/bin/env python3
-# PES-Scan - erzeugt von qc am {stamp}
-{provenance}
-#
-# Weitere Kurven einfach als zusaetzlichen Eintrag in DATASETS einfuegen:
-#     "Pd-Analogon": {{"x": [...], "y": [...]}},
-# Die y-Werte werden beim Plotten auf ihr jeweiliges Minimum bezogen.
-import matplotlib.pyplot as plt
-
-XLABEL = "{xlabel}"
-YLABEL = "{ylabel}"
-TITLE = "{title}"
-
-SMOOTH = True      # geschwungene Linie durch die Punkte (False = gerade Verbindungen)
-SMOOTH_N = 300     # Stuetzstellen der geglaetteten Kurve
-SHOW_POINTS = True # echte Rechenpunkte als Marker zeigen
-
-DATASETS = {{
-    "{label}": {{
-        "x": {xs},
-        "y": {ys},
-    }},
-}}
-
-# --- ab hier ist nichts mehr anzupassen ---
-
-def relative(y):
-    lo = min(y)
-    return [v - lo for v in y]
-
-
-def pchip(x, y, n=SMOOTH_N):
-    \"\"\"
-    Monotone kubische Hermite-Interpolation (Fritsch-Carlson).
-    Bewusst NICHT der klassische kubische Spline: der ueberschwingt zwischen
-    eng liegenden Punkten und erfindet dann Minima/Maxima, die es im Scan
-    nicht gibt. PCHIP bleibt zwischen den Datenpunkten.
-    \"\"\"
-    m = len(x)
-    if m < 3:
-        return list(x), list(y)
-    h = [x[i + 1] - x[i] for i in range(m - 1)]
-    d = [(y[i + 1] - y[i]) / h[i] for i in range(m - 1)]
-
-    tang = [0.0] * m
-    for i in range(1, m - 1):
-        if d[i - 1] * d[i] <= 0:
-            tang[i] = 0.0
-        else:
-            w1, w2 = 2 * h[i] + h[i - 1], h[i] + 2 * h[i - 1]
-            tang[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i])
-    tang[0] = d[0]
-    tang[-1] = d[-1]
-
-    xs, ys = [], []
-    for k in range(n):
-        t = x[0] + (x[-1] - x[0]) * k / (n - 1)
-        i = min(range(m - 1), key=lambda j: (t < x[j], t > x[j + 1], j))
-        for j in range(m - 1):
-            if x[j] <= t <= x[j + 1]:
-                i = j
-                break
-        s = (t - x[i]) / h[i]
-        h00 = 2 * s**3 - 3 * s**2 + 1
-        h10 = s**3 - 2 * s**2 + s
-        h01 = -2 * s**3 + 3 * s**2
-        h11 = s**3 - s**2
-        xs.append(t)
-        ys.append(h00 * y[i] + h10 * h[i] * tang[i]
-                  + h01 * y[i + 1] + h11 * h[i] * tang[i + 1])
-    return xs, ys
-
-
-def main():
-    fig, ax = plt.subplots(figsize=(6.0, 4.2))
-
-    for label, dset in DATASETS.items():
-        pairs = sorted(zip(dset["x"], relative(dset["y"])))
-        x = [p[0] for p in pairs]
-        y = [p[1] for p in pairs]
-
-        if SMOOTH:
-            sx, sy = pchip(x, y)
-            line, = ax.plot(sx, sy, linewidth=1.8, label=label)
-            if SHOW_POINTS:
-                ax.plot(x, y, linestyle="none", marker="o", markersize=4,
-                        color=line.get_color())
-        else:
-            ax.plot(x, y, marker="o", markersize=4, linewidth=1.6, label=label)
-
-        imax = max(range(len(y)), key=lambda i: y[i])
-        ax.annotate("%.1f" % y[imax], (x[imax], y[imax]),
-                    textcoords="offset points", xytext=(0, 8),
-                    ha="center", fontsize=9)
-
-    ax.set_xlabel(XLABEL)
-    ax.set_ylabel(YLABEL)
-    if TITLE:
-        ax.set_title(TITLE)
-    ax.axhline(0.0, color="0.7", linewidth=0.8, zorder=0)
-    if len(DATASETS) > 1:
-        ax.legend(frameon=False)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    fig.tight_layout()
-    fig.savefig("{stem}.png", dpi=300)
-    plt.show()
-
-
-if __name__ == "__main__":
-    main()
-"""
-
-
-def scan_members(data, prefix, cfg):
-    """
-    Alle Spezies eines Scans finden: Basenames, die mit <prefix>. beginnen und
-    danach nur noch eine Zahl tragen (z.B. nio_br_nio_p1_1.0, ....003, ....180).
-    Rückgabe: [(punktnummer, basename), ...] numerisch sortiert.
-    """
-    elec_role = "sp" if "sp" in data else "thermo"
-    bases = set()
-    for role in data:
-        bases.update(data[role]["BASENAME"].tolist())
-
-    out = []
-    for b in bases:
-        if not b.startswith(prefix + "."):
-            continue
-        tail = b[len(prefix) + 1:]
-        if tail.isdigit():
-            out.append((int(tail), b))
-    out.sort(key=lambda t: t[0])
-    return out, elec_role
-
-
-def cmd_scan(rest):
-    if not rest:
-        print('Verwendung: qc scan <prefix> <B i j | A i j k | D i j k l> [flags]\n'
-              '            [--plot <datei.py>] [--csv <datei.csv>] [--label <text>]',
-              file=sys.stderr)
-        sys.exit(1)
-
-    # eigene Optionen herausziehen, Rest geht an parse_data_flags
-    plot_path = csv_path = label = title = None
-    keep, i = [], 0
-    while i < len(rest):
-        a = rest[i]
-        if a == "--plot" and i + 1 < len(rest):
-            plot_path = rest[i + 1]; i += 1
-        elif a == "--csv" and i + 1 < len(rest):
-            csv_path = rest[i + 1]; i += 1
-        elif a == "--label" and i + 1 < len(rest):
-            label = rest[i + 1]; i += 1
-        elif a == "--title" and i + 1 < len(rest):
-            title = rest[i + 1]; i += 1
-        else:
-            keep.append(a)
-        i += 1
-
-    pos, opts = parse_data_flags(keep)
-    if len(pos) < 2:
-        print("Fehler: Prefix und Koordinate angeben, z.B. qc scan mycomplex B 1 2",
-              file=sys.stderr)
-        sys.exit(1)
-    prefix, coord_tokens = pos[0], pos[1:]
-    try:
-        kind, idx = parse_coord_spec(coord_tokens)
-    except ValueError as e:
-        print(f"Fehler: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    config = load_global_config()
-    project_name, project_path, _ = require_project(config)
-    cfg = load_data_config(project_path)
-    data = load_dataset(project_path, cfg)
-    quantity = opts["q"]
-    unit = check_unit(opts["unit"] or "kcal/mol")
-    methods, solvent = resolve_context(data, cfg, opts, strict=True)
-
-    members, _ = scan_members(data, prefix, cfg)
-    if not members:
-        print(f"Fehler: Keine Scanpunkte mit Prefix '{prefix}.' gefunden.", file=sys.stderr)
-        cands = sorted({b.rsplit(".", 1)[0] for role in data
-                        for b in data[role]["BASENAME"] if "." in b})
-        if cands:
-            print("Mögliche Prefixe:", ", ".join(cands[:10]), file=sys.stderr)
-        sys.exit(1)
-
-    rows, missing_geom, failed = [], [], []
-    for point, base in members:
-        try:
-            val, bd = species_value(data, cfg, base, quantity, sc=opts["sc"],
-                                    use_solv=opts["solv"], methods=methods, solvent=solvent,
-                                    use_boltz=opts["boltz"], use_bfreq=opts["bfreq"])
-        except (LookupError, ValueError) as e:
-            failed.append((base, str(e).splitlines()[0]))
-            continue
-        geo = find_geometry(project_path, base, cfg)
-        if geo is None:
-            missing_geom.append(base)
-            continue
-        try:
-            x = internal_coordinate(read_xyz(geo), kind, idx)
-        except (ValueError, OSError) as e:
-            failed.append((base, str(e)))
-            continue
-        rows.append({"point": point, "name": base, "x": x, "E": val})
-
-    for base, why in failed:
-        print(f"[WARN] {base} übersprungen: {why}", file=sys.stderr)
-    for base in missing_geom:
-        print(f"[WARN] {base}: keine Geometrie gefunden (siehe 'geometries' in data.yaml).",
-              file=sys.stderr)
-    if not rows:
-        print("Fehler: Kein einziger Punkt auswertbar.", file=sys.stderr)
-        sys.exit(1)
-    if len(rows) < len(members):
-        print(f"[WARN] {len(members) - len(rows)} von {len(members)} Punkten fehlen — "
-              f"die Kurve hat Lücken.", file=sys.stderr)
-
-    rows.sort(key=lambda r: r["x"])
-    lo = min(r["E"] for r in rows)
-    conv = UNIT_CONVERSION[unit]
-    for r in rows:
-        r["rel"] = (r["E"] - lo) * conv
-
-    cname, cunit = COORD_LABEL[kind.upper()]
-    xlabel = f"{cname} {kind.upper()}({', '.join(str(i) for i in idx)}) / {cunit}"
-    ylabel = f"rel. {quantity} / {unit}"
-
-    # Konsolenausgabe
-    print(f"--- Scan '{prefix}' ({len(rows)} Punkte, {quantity}) ---")
-    print(f" {'PUNKT':>6} {'x':>10} {'rel.':>12}   NAME")
-    for r in rows:
-        print(f" {r['point']:>6} {r['x']:>10.4f} {r['rel']:>12.3f}   {r['name']}")
-    imax = max(range(len(rows)), key=lambda i: rows[i]["rel"])
-    print(f"\n Barriere (Maximum): {rows[imax]['rel']:.2f} {unit} "
-          f"bei {rows[imax]['x']:.4f} {cunit}  [{rows[imax]['name']}]")
-
-    if csv_path:
-        with open(csv_path, "w") as f:
-            f.write(f"POINT;NAME;X;{quantity}_REL_{unit}\n")
-            for r in rows:
-                f.write(f"{r['point']};{r['name']};{r['x']:.6f};{r['rel']:.6f}\n")
-        print(f"[OK] {csv_path}")
-
-    if plot_path:
-        parts = [f"Projekt: {project_name}", f"Prefix: {prefix}", f"Größe: {quantity}"]
-        if methods.get("sp") or methods.get("thermo"):
-            parts.append("Funktional: " + str(methods.get("sp") or methods.get("thermo")))
-        if opts["solv"]:
-            parts.append(f"solvatisiert{f' ({solvent})' if solvent else ''}")
-        if opts["boltz"]:
-            parts.append("Boltzmann-korrigiert")
-        if opts["bfreq"]:
-            parts.append("SPH-Thermokorrektur")
-        if opts["sc"]:
-            parts.append("Standard-State-Correction")
-        stem = Path(plot_path).stem
-        code = PLOT_TEMPLATE.format(
-            stamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
-            provenance="\n".join(f"# {p}" for p in parts),
-            xlabel=xlabel, ylabel=ylabel, unit=unit,
-            title=title or "", stem=stem,
-            label=label or prefix,
-            xs="[" + ", ".join(f"{r['x']:.6f}" for r in rows) + "]",
-            ys="[" + ", ".join(f"{r['rel']:.6f}" for r in rows) + "]",
-        )
-        Path(plot_path).write_text(code)
-        print(f"[OK] {plot_path}  (in VS Code öffnen und ausführen)")
-
-
-# --- HILFE ---
-
-HELP = """qc — Projektmanager & Auswertung für QC-Rechnungen
-
-PROJEKTE
-  qc init <name>              Projektordner + Struktur anlegen und registrieren
-  qc add [<name>]             aktuellen Ordner als Projekt registrieren
-  qc rm <name>                Projekt aus der Registry entfernen (löscht nichts)
-  qc switch <name>            global aktives Projekt setzen
-  qc list                     alle Projekte anzeigen
-  qc status                   erkanntes Projekt, Shortcuts & Bookmarks
-
-SHORTCUTS (commands.json)
-  qc <shortcut> [args...]     Befehl ausführen, args werden angehängt
-  qc -p <shortcut> [args]     Befehl nur ausgeben (kopieren & anpassen)
-  qc add name="befehl"        Shortcut hinzufügen/überschreiben
-  qc rmcmd <name>             Shortcut entfernen
-  qc cmds                     Shortcuts auflisten
-  qc edit                     commands.json im $EDITOR öffnen
-  qc history [n]              zuletzt ausgeführte Befehle
-
-BOOKMARKS (Rechenordner)
-  qc mark <name> [pfad]       Ordner (Default: cwd) merken
-  qc marks                    Bookmarks auflisten
-  qc unmark <name>            Bookmark entfernen
-  qc go <name> | root         hinspringen (braucht den Shell-Wrapper)
-
-DATENQUELLEN (data.yaml)
-  qc data init                data.yaml-Vorlage anlegen
-  qc data add <rolle> <csv> [-f <funktional>] [-lm <lösemittel>]
-                              Rollen: thermo | sp | solv | boltz | bfreq
-  qc data rm <rolle> [csv]    Quelle (oder alle der Rolle) entfernen
-  qc data scan [-w]           CSVs im Projekt finden (-w schreibt sie ein)
-  qc data check               Quellen prüfen: Konvergenz, Duplikate, Abdeckung
-  qc data update [-a]         Sammel-CSVs ~/.qc_data/<projekt>_main_<rolle>.csv
-                              aktualisieren (-a: alle Projekte)
-  qc data main                Inhalt der Sammel-CSVs zusammenfassen
-
-THERMOCHEMIE
-  qc species                  Spezies + Datenabdeckung + Funktionale
-  qc e|u|h|g <name...>        E/U/H/G einer Spezies (Default: Eh, Gasphase)
-  qc rxn "a + 2 b -> c"       Reaktionsenergie ad-hoc (Default: kcal/mol)
-  qc rxn <name>               gespeicherte Reaktion rechnen
-  qc rxn add <name> "a -> b"  Reaktion speichern
-  qc rxn rm <name> | list     Reaktion löschen / alle anzeigen
-
-PES-SCANS
-  qc scan <prefix> B i j            Scan über Bindungslänge (Å)
-  qc scan <prefix> A i j k          über Winkel (°, j = Scheitel)
-  qc scan <prefix> D i j k l        über Diederwinkel (°)
-                              Punkte = <prefix>.<nummer>, Koordinate wird aus
-                              den Geometrien berechnet ('geometries' in data.yaml)
-    --plot <datei.py>         matplotlib-Skript schreiben (Daten eingebettet)
-    --csv <datei.csv>         Rohwerte exportieren
-    --label / --title <text>  Kurvenname / Titel im Plot
-
-  Flags:
-    -q E|U|H|G                Größe (nur bei rxn; Default G)
-    -m <M>  oder  name@M      Multiplizität wählen
-    -solv                     mit Gsolv rechnen (Default: Gasphase)
-    -lm <lösemittel>          Lösemittel wählen, z.B. -lm 1,2-dichloroethane
-    -boltz                    Ensemble-/Boltzmann-Korrektur addieren (G_AV - G_LOW)
-    -bfreq                    Thermokorrektur aus der SPH-Quelle statt aus thermo
-    -sc                       Standard-State-Correction (1 atm -> 1 M, nur G)
-    -f <funktional>           Funktional der Hauptenergie
-    -ft <funktional>          Funktional der Thermokorrektur (darf abweichen)
-    -fsolv / -fboltz <f>      Funktional der Solvatations-/Ensemble-Daten
-    -u <einheit>              hartree | kcal/mol | kj/mol | ev
-    -v                        Aufschlüsselung aller Beiträge
-    -gas                      erzwingt Gasphase (falls solvation: true gesetzt)
-
-SHELL-INTEGRATION (einmalig in ~/.bashrc)
-  eval "$(qc shellrc)"
-"""
-
-
-# --- MAIN ---
-
-def main():
-    args = sys.argv[1:]
-
-    # -p / --print überall erlauben und herausfiltern
+def complete_words(cword, words):
+    """Candidates for word number cword of the command line 'words' (bash COMP_WORDS)."""
+    words = list(words[1:])
+    i = cword - 1
+    cur = words[i] if 0 <= i < len(words) else ""
+    prev = words[:max(i, 0)]
     print_only = False
-    for flag in ("-p", "--print"):
-        while flag in args:
-            args.remove(flag)
-            print_only = True
+    while prev and prev[0] in ("-p", "--print"):
+        prev, print_only = prev[1:], True
+    project = find_project()
+    cmds = project.load_commands() if project else {"commands": {}, "paths": {}}
 
-    if not args:
-        print(HELP)
-        sys.exit(0)
+    def flags(command):
+        parser = build_parser()
+        sub = parser._qc_subparsers.get(command)
+        return sorted(o for o in (sub._option_string_actions if sub else {}) if o.startswith("--")
+                      or len(o) == 2)
 
-    command, rest = args[0], args[1:]
-
-    if command in ("help", "-h", "--help"):
-        print(HELP)
-
-    elif command == "init":
-        if not rest:
-            print("Name fehlt: qc init <name>", file=sys.stderr); sys.exit(1)
-        init_project(rest[0])
-
-    elif command == "add":
-        joined = " ".join(rest)
-        if "=" in joined:
-            add_command(joined)          # qc add name="befehl"
-        elif rest:
-            register_project(rest[0])    # qc add <projektname>  (cwd)
-        else:
-            register_project(Path.cwd().name)  # qc add  -> cwd unter Ordnernamen
-
-    elif command == "rm":
-        if not rest:
-            print("Name fehlt: qc rm <projekt>", file=sys.stderr); sys.exit(1)
-        remove_project(rest[0])
-
-    elif command == "switch":
-        if not rest:
-            print("Name fehlt: qc switch <projekt>", file=sys.stderr); sys.exit(1)
-        switch_project(rest[0])
-
-    elif command == "list":
-        list_projects()
-
-    elif command == "cmds":
-        list_commands()
-
-    elif command == "rmcmd":
-        if not rest:
-            print("Name fehlt: qc rmcmd <shortcut>", file=sys.stderr); sys.exit(1)
-        remove_command(rest[0])
-
-    elif command == "mark":
-        if not rest:
-            print("Name fehlt: qc mark <name> [pfad]", file=sys.stderr); sys.exit(1)
-        mark_path(rest[0], rest[1] if len(rest) > 1 else None)
-
-    elif command == "marks":
-        list_marks()
-
-    elif command == "unmark":
-        if not rest:
-            print("Name fehlt: qc unmark <name>", file=sys.stderr); sys.exit(1)
-        unmark_path(rest[0])
-
-    elif command == "go":
-        if not rest:
-            list_marks()
-        else:
-            go_mark(rest[0])
-
-    elif command == "status":
-        show_status()
-
-    elif command == "edit":
-        edit_config()
-
-    elif command == "history":
-        n = int(rest[0]) if rest and rest[0].isdigit() else 15
-        show_history(n)
-
-    elif command == "shellrc":
-        print_shellrc()
-
-    elif command == "data":
-        cmd_data(rest)
-
-    elif command == "species":
-        cmd_species()
-
-    elif command in ("e", "u", "h", "g"):
-        cmd_energy(command.upper(), rest)
-
-    elif command == "rxn":
-        cmd_reaction(rest)
-
-    elif command == "scan":
-        cmd_scan(rest)
-
+    if not prev:
+        cands = list(cmds["commands"]) + ([] if print_only else list(COMMAND_NAMES))
+        if cur.startswith("-"):
+            cands = ["-p", "--print", "-h", "--help", "--version"]
     else:
-        # Shortcut-Ausführung: alles nach dem Shortcut wird angehängt.
-        # Altes '-e "..."' funktioniert weiterhin:
-        if "-e" in rest:
-            idx = rest.index("-e")
-            extra = rest[:idx] + rest[idx + 1:]
+        command, args = prev[0], prev[1:]
+        positional = [a for a in args if not a.startswith("-")]
+        if command in cmds["commands"] and command not in COMMAND_NAMES:
+            return []
+        if cur.startswith("-") and command in COMMAND_NAMES:
+            return [c for c in flags(command) if c.startswith(cur)]
+        cands = []
+        if command == "help" and not args:
+            cands = list(COMMAND_NAMES)
+        elif command in GROUP_VERBS and not positional:
+            cands = list(GROUP_VERBS[command])
+            if command == "rxn" and project and project.data_file.exists():
+                cands += list(load_data_config(project)["reactions"])
+        elif command == "go" and not positional:
+            cands = list(cmds["paths"]) + ["root"]
+        elif command == "mark" and positional == ["rm"]:
+            cands = list(cmds["paths"])
+        elif command == "cmd" and positional == ["rm"]:
+            cands = list(cmds["commands"])
+        elif command == "project" and positional in (["rm"], ["switch"]):
+            cands = list(load_registry()["projects"])
+        elif command == "data" and positional in (["add"], ["rm"]):
+            cands = list(ROLES)
+        elif command == "rxn" and positional == ["rm"] and project:
+            cands = list(load_data_config(project)["reactions"])
+        elif command in ("e", "u", "h", "g"):
+            cands = _complete_species()
+        elif command == "scan":
+            cands = _complete_species(include_scans=True) if not positional else (
+                ["B", "A", "D"] if len(positional) == 1 else [])
+    return sorted({c for c in cands if c.startswith(cur)})
+
+
+def cmd_complete(args):
+    try:
+        for c in complete_words(int(args.cword), args.words):
+            print(c)
+    except Exception:
+        pass   # completion must never print errors
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Command line
+# ════════════════════════════════════════════════════════════════════════════
+
+OVERVIEW = f"""\
+qc {__version__} - project manager and analysis tool for quantum-chemical calculations
+
+usage: qc <command> [options]          details: qc <command> -h
+       qc [-p] <shortcut> [args...]
+
+Projects
+  init <name>                    create a project folder with skeleton and register it
+  project [ls|add|rm|switch]     manage the registered projects
+  status                         show the current project
+
+Shortcuts (commands.json)
+  <shortcut> [args...]           run a shortcut, args are appended (-p: only print it)
+  cmd [ls|add|rm|edit]           manage the shortcuts
+  history [n]                    last shortcut runs
+
+Bookmarks
+  mark [ls|add|rm]               manage bookmarked directories
+  go <mark>|root                 cd to a bookmark (needs the shell integration)
+
+Data (data.yaml)
+  data [ls|init|add|rm|find|check|edit|archive]
+                                 manage the CSV sources
+
+Thermochemistry
+  species [pattern]              species and their data coverage
+  e|u|h|g <species>...           absolute E, U, H or G
+  rxn "<a + 2 b -> c>"|<name>    reaction energy
+  rxn [ls|add|rm]                manage named reactions
+
+PES scans
+  scan [<prefix> <B i j | A i j k | D i j k l>]
+                                 relaxed scan: table, CSV, plot
+
+Setup
+  shellrc                        shell integration; put  eval "$(qc shellrc)"  in ~/.bashrc
+"""
+
+THERMO_EPILOG = """\
+energies:
+  E    electronic energy (sp source if configured, else ENERGY of thermo)
+  U/H  E + dU/dH of the thermo source
+  G    E + dG of the thermo source, or of the bfreq source with --bfreq
+  optional terms: + Gsolv (--solv), + G_AV - G_LOW (--boltz),
+                  + RT ln(c°RT/p°) for 1 atm -> 1 mol/L (--sc, G only)
+"""
+
+
+class _Formatter(argparse.RawDescriptionHelpFormatter):
+    def __init__(self, prog):
+        super().__init__(prog, max_help_position=30, width=96)
+
+
+def add_thermo_args(p, quantity_default=None, scan=False):
+    g = p.add_argument_group("thermochemistry options")
+    if quantity_default:
+        g.add_argument("-q", "--quantity", type=str.upper, choices=["E", "U", "H", "G"],
+                       default=quantity_default, metavar="Q",
+                       help=("shown next to E: G (default), H or U; E: only E" if scan
+                             else f"E, U, H or G (default: {quantity_default})"))
+    g.add_argument("-u", "--unit", metavar="UNIT",
+                   help="Eh, kcal/mol, kJ/mol or eV (default: "
+                        + ("Eh" if not quantity_default else f"'unit' in {DATA_FILE}") + ")")
+    g.add_argument("-m", "--mult", type=int, metavar="M",
+                   help="multiplicity (or per species: name@M)")
+    g.add_argument("-f", "--functional", metavar="F", help="functional of the electronic energy")
+    g.add_argument("--ft", metavar="F", help="functional of the thermal correction")
+    g.add_argument("--fsolv", metavar="F", help="method of the solvation data")
+    g.add_argument("--fboltz", metavar="F", help="method of the ensemble data")
+    g.add_argument("--fbfreq", metavar="F", help="method of the bfreq data")
+    solv = g.add_mutually_exclusive_group()
+    solv.add_argument("--solv", dest="solv", action="store_const", const=True, default=None,
+                      help="add the solvation free energy Gsolv")
+    solv.add_argument("--gas", dest="solv", action="store_const", const=False,
+                      help="gas phase (overrides 'solvation: true')")
+    g.add_argument("-s", "--solvent", metavar="NAME", help="solvent (implies --solv)")
+    boltz = g.add_mutually_exclusive_group()
+    boltz.add_argument("--boltz", dest="boltz", action="store_const", const=True, default=None,
+                       help="add the conformer-ensemble correction G_AV - G_LOW")
+    boltz.add_argument("--no-boltz", dest="boltz", action="store_const", const=False,
+                       help=argparse.SUPPRESS)
+    bfreq = g.add_mutually_exclusive_group()
+    bfreq.add_argument("--bfreq", dest="bfreq", action="store_const", const=True, default=None,
+                       help="thermal correction to G from the bfreq source"
+                            + (" (default for scans if available)" if scan else ""))
+    bfreq.add_argument("--no-bfreq", dest="bfreq", action="store_const", const=False,
+                       help="thermal correction from the thermo source")
+    sc = g.add_mutually_exclusive_group()
+    sc.add_argument("--sc", dest="sc", action="store_const", const=True, default=None,
+                    help="standard-state correction 1 atm -> 1 mol/L (G only)")
+    sc.add_argument("--no-sc", dest="sc", action="store_const", const=False,
+                    help=argparse.SUPPRESS)
+    g.add_argument("-v", "--verbose", action="store_true", help="show all contributions")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="qc", add_help=False, allow_abbrev=False,
+                                     formatter_class=_Formatter)
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+    subs = {}
+
+    def command(name, help_, description=None, epilog=None, **kw):
+        p = sub.add_parser(name, help=help_, description=description or help_[:1].upper()
+                           + help_[1:] + ".", epilog=epilog, formatter_class=_Formatter,
+                           allow_abbrev=False, **kw)
+        subs[name] = p
+        return p
+
+    def group(p, title):
+        verbs = p.add_subparsers(dest="verb", metavar="<action>", title=title)
+        return lambda name, help_: verbs.add_parser(name, help=help_, description=help_[:1].upper()
+                                                    + help_[1:] + ".", formatter_class=_Formatter,
+                                                    allow_abbrev=False)
+
+    # projects
+    p = command("init", "create a project folder with skeleton and register it",
+                epilog=f"Creates <name>/ with {', '.join(PROJECT_FOLDERS)},\n"
+                       f"{COMMANDS_FILE} (default shortcuts) and {DATA_FILE} (template).")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_init)
+
+    p = command("project", "manage the registered projects",
+                description="Manage the registered projects. Without an action: list them.\n"
+                            "Inside a project folder qc uses that project, elsewhere the "
+                            "active one.")
+    p.set_defaults(group_default=cmd_project_ls)
+    verb = group(p, "actions")
+    verb("ls", "list the projects").set_defaults(func=cmd_project_ls)
+    v = verb("add", "register an existing folder as project (and make it active)")
+    v.add_argument("name", nargs="?", help="project name (default: folder name)")
+    v.add_argument("--path", metavar="DIR", help="folder (default: current directory)")
+    v.set_defaults(func=cmd_project_add)
+    v = verb("rm", "unregister a project (its files are kept)")
+    v.add_argument("name")
+    v.set_defaults(func=cmd_project_rm)
+    v = verb("switch", "set the active project (used outside of project folders)")
+    v.add_argument("name")
+    v.set_defaults(func=cmd_project_switch)
+
+    command("status", "show the current project").set_defaults(func=cmd_status)
+
+    # shortcuts
+    p = command("cmd", "manage the shortcuts of the project",
+                description=f"Manage the command shortcuts in {COMMANDS_FILE}. Without an "
+                            f"action: list them.\nRun one with 'qc <shortcut> [args...]'; the "
+                            f"args are appended.\n'qc -p <shortcut> [args...]' only prints the "
+                            f"command.")
+    p.set_defaults(group_default=cmd_cmd_ls)
+    verb = group(p, "actions")
+    verb("ls", "list the shortcuts").set_defaults(func=cmd_cmd_ls)
+    v = verb("add", "add or replace a shortcut")
+    v.add_argument("name")
+    v.add_argument("command", nargs=argparse.REMAINDER, help="the command (quoted or not)")
+    v.epilog = 'example: qc cmd add sp "inporca -j sp -f r2scan0 -bs def2-QZVPPD"'
+    v.set_defaults(func=cmd_cmd_add)
+    v = verb("rm", "remove a shortcut")
+    v.add_argument("name")
+    v.set_defaults(func=cmd_cmd_rm)
+    verb("edit", f"open {COMMANDS_FILE} in $EDITOR").set_defaults(func=cmd_cmd_edit)
+
+    p = command("history", "show the last shortcut runs")
+    p.add_argument("n", nargs="?", type=int, default=15, help="number of entries (default: 15)")
+    p.set_defaults(func=cmd_history)
+
+    # bookmarks
+    p = command("mark", "manage bookmarked directories",
+                description="Bookmark directories of the project. Without an action: list "
+                            "them.\nJump to one with 'qc go <name>'.")
+    p.set_defaults(group_default=cmd_mark_ls)
+    verb = group(p, "actions")
+    verb("ls", "list the bookmarks").set_defaults(func=cmd_mark_ls)
+    v = verb("add", "bookmark a directory")
+    v.add_argument("name")
+    v.add_argument("dir", nargs="?", help="directory (default: current directory)")
+    v.set_defaults(func=cmd_mark_add)
+    v = verb("rm", "remove a bookmark")
+    v.add_argument("name")
+    v.set_defaults(func=cmd_mark_rm)
+
+    p = command("go", "cd to a bookmark or to the project root",
+                description="cd to a bookmark ('root': the project root). Without the shell "
+                            "integration\nthis only prints the path; set it up with:\n"
+                            '  eval "$(qc shellrc)"   (in ~/.bashrc or ~/.zshrc)')
+    p.add_argument("name", nargs="?", help="bookmark or 'root' (none: list the bookmarks)")
+    p.set_defaults(func=cmd_go)
+
+    # data
+    p = command("data", "manage the CSV data sources",
+                description=f"Manage the data sources in {DATA_FILE}. Without an action: "
+                            f"show them.",
+                epilog="roles:\n" + "\n".join(f"  {r:<7} {ROLE_INFO[r]}" for r in ROLES))
+    p.set_defaults(group_default=cmd_data_ls)
+    verb = group(p, "actions")
+    verb("ls", "show the data sources").set_defaults(func=cmd_data_ls)
+    verb("init", f"create a {DATA_FILE} template").set_defaults(func=cmd_data_init)
+    v = verb("add", "add a CSV file as source of a role")
+    v.add_argument("role", help=", ".join(ROLES))
+    v.add_argument("file")
+    v.add_argument("-f", "--functional", metavar="F",
+                   help="functional of the file (overrides its METHOD column)")
+    v.add_argument("-s", "--solvent", metavar="NAME",
+                   help="solvent of the file (overrides its SOLVENT column)")
+    v.epilog = "roles:\n" + "\n".join(f"  {r:<7} {ROLE_INFO[r]}" for r in ROLES)
+    v.set_defaults(func=cmd_data_add)
+    v = verb("rm", "remove a source (or all sources of a role)")
+    v.add_argument("role", help=", ".join(ROLES))
+    v.add_argument("file", nargs="?", help="path or file name (default: all of the role)")
+    v.set_defaults(func=cmd_data_rm)
+    v = verb("find", "find CSV files in the project and guess their role")
+    v.add_argument("-w", "--write", action="store_true",
+                   help=f"add all new files to {DATA_FILE}")
+    v.set_defaults(func=cmd_data_find)
+    verb("check", "check convergence, duplicates, coverage and charges").set_defaults(
+        func=cmd_data_check)
+    verb("edit", f"open {DATA_FILE} in $EDITOR").set_defaults(func=cmd_data_edit)
+    v = verb("archive", "collect the data in ~/.qc_data/<project>_main_<role>.csv")
+    v.description = ("Collect all data of the project per role in\n"
+                     "~/.qc_data/<project>_main_<role>.csv (updated on every 'qc data add').\n"
+                     "Rows are keyed by species, M, charge, functional and solvent; new values "
+                     "replace old ones,\nrows whose source is gone are kept.")
+    v.add_argument("-a", "--all", action="store_true", help="archive all registered projects")
+    v.add_argument("-l", "--list", action="store_true", help="summarize the archive files")
+    v.set_defaults(func=cmd_data_archive)
+
+    # thermochemistry
+    p = command("species", "list the species and their data coverage",
+                description="List the species with one column per source, functional and "
+                            "solvent\n(x: data available).")
+    p.add_argument("pattern", nargs="?", help="filter, e.g. 'ni*' (plain text: substring)")
+    p.set_defaults(func=cmd_species)
+
+    for q, name in (("e", "electronic energy E"), ("u", "internal energy U"),
+                    ("h", "enthalpy H"), ("g", "free energy G")):
+        p = command(q, f"absolute {name} of species", epilog=THERMO_EPILOG)
+        add_energy_args(p)
+        add_thermo_args(p)
+        p.set_defaults(func=cmd_energy)
+
+    p = command("rxn", "reaction energies and named reactions",
+                usage='qc rxn "<a + 2 b -> c>" | <name>  [options]\n'
+                      '       qc rxn [ls | add <name> "<equation>" | rm <name>]',
+                description="Reaction energy from an equation or a named reaction "
+                            f"(stored in {DATA_FILE}).\nWithout arguments: list the named "
+                            f"reactions. Species are separated by '+', coefficients\nprecede "
+                            f"them ('2 b'), 'name@M' selects a multiplicity.",
+                epilog=THERMO_EPILOG + "\nexamples:\n"
+                       '  qc rxn "ni_h -> ni + h" -s thf --sc -v\n'
+                       '  qc rxn add deprot "ni_h -> ni + h"\n'
+                       "  qc rxn deprot -q H")
+    p.add_argument("words", nargs="*", help=argparse.SUPPRESS)
+    add_thermo_args(p, quantity_default="G")
+    p.set_defaults(func=cmd_rxn)
+
+    p = command("scan", "evaluate a relaxed PES scan",
+                usage="qc scan [<prefix> <B i j | A i j k | D i j k l>] [options]",
+                description="Relaxed PES scan over the species <prefix>.<number>. The scan "
+                            "coordinate is computed from\nthe geometries ('geometries' in "
+                            f"{DATA_FILE}). Without a prefix: list the scans.\n\n"
+                            "By default E and G are shown; G uses the bfreq (single-point "
+                            "Hessian) correction\nif it covers the scan, otherwise the thermo "
+                            "correction. Energies are relative to\nthe minimum of each curve.",
+                epilog="plots:\n"
+                       "  --plot scan.py    editable matplotlib script with the data embedded\n"
+                       "  --plot scan.pdf   render directly (.png, .pdf, .svg)\n"
+                       "  --plot scan.py --append   add this scan to an existing script\n\n"
+                       "examples:\n"
+                       "  qc scan ni_br B 1 2 --plot ni_br.py\n"
+                       "  qc scan pd_br B 1 2 --plot ni_br.py --append --label Pd\n"
+                       "  qc scan rot D 1 2 3 4 -q E --csv rot.csv")
+    p.add_argument("prefix", nargs="?", help=argparse.SUPPRESS)
+    p.add_argument("coordinate", nargs="*", help=argparse.SUPPRESS)
+    g = p.add_argument_group("scan options")
+    g.add_argument("-0", "--zero-based", action="store_true",
+                   help="atom numbers start at 0 (as in ORCA input); default: 1")
+    g.add_argument("--plot", action="append", metavar="FILE",
+                   help="write a plot script (.py) or image (.png/.pdf/.svg); repeatable")
+    g.add_argument("--append", action="store_true", help="add to an existing plot script")
+    g.add_argument("--label", metavar="TEXT", help="name of this scan in the plot (default: prefix)")
+    g.add_argument("--title", metavar="TEXT", help="plot title")
+    g.add_argument("--csv", metavar="FILE", help="export the table as ';'-separated CSV")
+    add_thermo_args(p, quantity_default="G", scan=True)
+    p.set_defaults(func=cmd_scan)
+
+    # setup
+    command("shellrc", "print the shell integration (cd for 'qc go', completion)",
+            description='Print the shell integration for bash and zsh. Add to ~/.bashrc or '
+                        '~/.zshrc:\n  eval "$(qc shellrc)"').set_defaults(func=cmd_shellrc)
+    p = command("__complete", argparse.SUPPRESS)
+    p.add_argument("cword")
+    p.add_argument("words", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_complete)
+
+    parser._qc_subparsers = subs
+    return parser
+
+
+COMMAND_NAMES = ("init", "project", "status", "cmd", "history", "mark", "go", "data",
+                 "species", "e", "u", "h", "g", "rxn", "scan", "shellrc", "help")
+GROUP_VERBS = {
+    "project": ("ls", "add", "rm", "switch"),
+    "cmd": ("ls", "add", "rm", "edit"),
+    "mark": ("ls", "add", "rm"),
+    "data": ("ls", "init", "add", "rm", "find", "check", "edit", "archive"),
+    "rxn": ("ls", "add", "rm"),
+}
+RESERVED = set(COMMAND_NAMES) | {"__complete"}
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+    print_only = False
+    while argv and argv[0] in ("-p", "--print"):
+        print_only = True
+        argv.pop(0)
+    if not argv or argv[0] in ("-h", "--help"):
+        print(OVERVIEW.rstrip())
+        return 0
+    if argv[0] == "--version":
+        print(f"qc {__version__}")
+        return 0
+    if argv[0] == "help":
+        if len(argv) > 1 and argv[1] in COMMAND_NAMES and argv[1] != "help":
+            argv = [argv[1], "-h"]
         else:
-            extra = rest
-        run_calc_command(command, extra, print_only=print_only)
+            print(OVERVIEW.rstrip())
+            return 0
+
+    name = argv[0]
+    if name not in RESERVED:
+        if name.startswith("-"):
+            raise QCError(f"unknown option '{name}'. Run 'qc -h' for help.")
+        return run_shortcut(name, argv[1:], print_only)
+    if print_only:
+        raise QCError("-p only applies to shortcuts: qc -p <shortcut> [args...]")
+
+    parser = build_parser()
+    if name in GROUP_VERBS and name != "rxn" or name == "__complete":
+        args = parser.parse_args(argv)
+    else:   # options may come anywhere, e.g. qc g a -f pwpb95 b
+        args = parser._qc_subparsers[name].parse_intermixed_args(argv[1:])
+        args.command = name
+    func = getattr(args, "func", None) or getattr(args, "group_default")
+    return func(args) or 0
 
 
 if __name__ == "__main__":
     try:
-        main()
-    except BrokenPipeError:
-        # z.B. 'qc help | head' — sauber beenden statt Traceback
+        sys.exit(main())
+    except QCError as e:
+        print(f"{style('error:', '31;1', sys.stderr)} {e}", file=sys.stderr)
+        sys.exit(1)
+    except BrokenPipeError:   # e.g. 'qc species | head'
         try:
             sys.stdout.close()
         finally:
             os._exit(0)
     except KeyboardInterrupt:
-        print("\nAbgebrochen.", file=sys.stderr)
+        print("\nInterrupted.", file=sys.stderr)
         sys.exit(130)
