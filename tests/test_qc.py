@@ -7,7 +7,9 @@ import sys
 import pytest
 
 import qc
-from conftest import ROOT
+from conftest import ROOT, SPECIES
+
+pd = pytest.importorskip("pandas")
 
 
 # ── pure functions ────────────────────────────────────────────────────────────
@@ -272,6 +274,54 @@ def test_species_table(project, run):
     assert rc == 0 and "scanx.7" in out and "ni_h" not in out
 
 
+# ── charge and multiplicity come with the species name ───────────────────────
+
+def _species_rows(out, name):
+    return [line.split() for line in out.splitlines() if line.split()[:1] == [name]]
+
+
+def test_charge_mult_taken_by_name(project, run):
+    # solv and bfreq have no CHRG/M columns: one row per species, q/M from thermo/sp
+    rc, out, _ = run("species", "ni")
+    rows = _species_rows(out, "ni_h")
+    assert len(rows) == 1 and rows[0][1:3] == ["0", "2"]
+    assert rows[0][3:8] == ["x"] * 5        # thermo, 2x sp, 2x solv in one row
+    rows = _species_rows(run("species", "scanx.3")[1], "scanx.3")
+    assert len(rows) == 1 and rows[0][-1] == "x"            # bfreq in the same row
+    data = qc.load_dataset(qc.current_project(), qc.load_data_config(qc.current_project()))
+    solv = data["solv"].set_index(["BASENAME", "SOLVENT"])
+    assert solv.loc[("ni_h", "thf"), "CHRG"] == 0 and solv.loc[("ni_h", "thf"), "M"] == 2
+
+
+def test_multiplicity_selection_with_sources_without_m(project, run):
+    rc, out, err = run("g", "ni_h@2", "-f", "pwpb95", "-s", "thf")
+    assert rc == 0, err
+    assert _value(out) == pytest.approx(-200.60 + 0.001 - 0.007)
+    rc, out, err = run("g", "scanx.3@1", "-f", "pwpb95", "--bfreq")
+    assert rc == 0, err
+
+
+def test_conflicting_multiplicity_is_reported(project, run):
+    with open(project / "2_sp/pwpb95.csv", "a") as f:
+        f.write("ni_h.sp;0;4;pwpb95;-200.55;True\n")
+    rc, out, err = run("data", "check")
+    assert "ni_h appears with different multiplicities (2, 4)" in err
+    # the solv rows of ni_h stay unassigned, but still match either state
+    rc, out, err = run("e", "ni_h@4", "-f", "pwpb95", "-s", "thf")
+    assert rc == 0, err
+
+
+def test_archive_fills_rows_written_without_charge_mult(project, run):
+    assert run("data", "archive")[0] == 0
+    target = qc.archive_path("proj", "solv")
+    df = pd.read_csv(target, sep=";")
+    df["CHRG"], df["M"] = float("nan"), float("nan")      # as written before this fix
+    df.to_csv(target, sep=";", index=False)
+    assert run("data", "archive")[0] == 0
+    df = pd.read_csv(target, sep=";")
+    assert len(df) == 2 * len(SPECIES) and df["M"].notna().all()
+
+
 # ── scans ─────────────────────────────────────────────────────────────────────
 
 def _scan_rows(out):
@@ -291,7 +341,7 @@ def test_scan_default_e_and_g(project, run):
 
 def test_scan_prefers_bfreq_when_complete(project, run):
     with open(project / "sph/bfreq.csv", "a") as f:
-        f.write("scanx.7.bfreq;0;1;gfn2;0.017\n")
+        f.write("scanx.7.bfreq;gfn2;0.017\n")
     rc, out, err = run("scan", "scanx", "B", "1", "2", "-f", "pwpb95")
     assert "bfreq dG (gfn2)" in out and "thermo correction" not in err
 

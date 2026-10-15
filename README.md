@@ -101,6 +101,11 @@ Optional columns: `CHRG`/`CHARGE`, `M`/`MULTIPLICITY`, `METHOD`, `SOLVENT`,
 The species name is `NAME` without the parts listed in `strip_suffixes`
 (`a.oet2.optfreq` → `a.oet2`). `name@M` selects a multiplicity.
 
+Charge and multiplicity belong to the species name: rows without `CHRG`/`M`
+(typically the `solv` and `bfreq` files) take them from the other sources of the
+same name. `qc data check` reports names that appear with different charges or
+multiplicities.
+
 `qc data archive` collects all data of a project per role in
 `~/.qc_data/<project>_main_<role>.csv` (also updated on every `qc data add`); rows
 whose source CSV has been deleted are kept.
