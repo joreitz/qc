@@ -798,7 +798,11 @@ def read_csv(path):
 
 
 def load_dataset(project, cfg, require=True):
-    """{role: DataFrame} with the added columns BASENAME, METHOD, SOLVENT, SOURCEFILE."""
+    """
+    {role: DataFrame} with the added columns BASENAME, METHOD, SOLVENT, SOURCEFILE.
+    CHRG and M are always present: rows without them take them from the other
+    sources of the same species name.
+    """
     import pandas as pd   # read_csv has already checked the import
 
     strip = set(cfg["strip_suffixes"])
@@ -826,11 +830,51 @@ def load_dataset(project, cfg, require=True):
             frames.append(df)
         if frames:
             data[role] = pd.concat(frames, ignore_index=True)
+    known = charge_mult_by_name(data.values())
+    for df in data.values():
+        fill_charge_mult(df, known)
     if require and "thermo" not in data and "sp" not in data:
         raise QCError(f"no usable 'thermo' or 'sp' source in {DATA_FILE}.\n"
                       f"Add one with 'qc data add <role> <file.csv>' "
                       f"(or find candidates with 'qc data find').")
     return data
+
+
+def _integers(series):
+    """Numeric column as nullable integers (empty cells stay empty)."""
+    import pandas as pd
+    values = pd.to_numeric(series, errors="coerce")
+    present = values.dropna()
+    if (present == present.round()).all():
+        return values.round().astype("Int64")
+    return values
+
+
+def charge_mult_by_name(frames):
+    """
+    {"CHRG": {name: q}, "M": {name: M}} from all rows that give them. The species
+    name determines charge and multiplicity, so a name with conflicting values
+    is left out (and reported by 'qc data check').
+    """
+    seen = {"CHRG": {}, "M": {}}
+    for df in frames:
+        for col, values in seen.items():
+            if col in df.columns:
+                numbers = _integers(df[col])
+                given = numbers.notna()
+                for base, v in zip(df["BASENAME"][given], numbers[given]):
+                    values.setdefault(base, set()).add(int(v))
+    return {col: {b: next(iter(v)) for b, v in values.items() if len(v) == 1}
+            for col, values in seen.items()}
+
+
+def fill_charge_mult(df, known):
+    """Fill missing CHRG/M of a source (e.g. solv, bfreq) by species name."""
+    import pandas as pd
+    for col in ("CHRG", "M"):
+        values = (pd.to_numeric(df[col], errors="coerce").astype("float") if col in df.columns
+                  else pd.Series(float("nan"), index=df.index))
+        df[col] = _integers(values.fillna(df["BASENAME"].map(known[col])))
 
 
 def elec_role(data):
@@ -911,7 +955,8 @@ FUNCTIONAL_FLAG = {"sp": "-f", "thermo": "--ft", "solv": "--fsolv", "boltz": "--
 def pick_row(df, base, m, role, method=None, solvent=None, flag=None):
     hits = df[df["BASENAME"] == base]
     if m is not None and "M" in hits.columns:
-        hits = hits[hits["M"].astype(float) == float(m)]
+        mult = hits["M"].astype(float)
+        hits = hits[mult.isna() | (mult == float(m))]   # rows without M match any
     if method is not None:
         hits = hits[hits["METHOD"] == method]
     if solvent is not None and hits["SOLVENT"].notna().any():
@@ -2376,18 +2421,17 @@ def cmd_data_check(args):
                 warn(f"boltz solvent '{solvent}' does not occur in the solv source "
                      f"({', '.join(sorted(known)) or '-'}) - add it to 'solvent_aliases'?")
 
-    # charge consistency across sources
-    charges = {}
-    for role, df in data.items():
-        if "CHRG" in df.columns:
-            for base, q in zip(df["BASENAME"], df["CHRG"]):
-                try:
-                    charges.setdefault(base, set()).add(int(float(q)))
-                except (TypeError, ValueError):
-                    pass
-    for base, qs in sorted(charges.items()):
-        if len(qs) > 1:
-            warn(f"{base} appears with different charges ({', '.join(map(str, sorted(qs)))}).")
+    # the species name determines charge and multiplicity
+    for col, what in (("CHRG", "charges"), ("M", "multiplicities")):
+        values = {}
+        for df in data.values():
+            given = df[col].notna()
+            for base, v in zip(df["BASENAME"][given], df[col][given]):
+                values.setdefault(base, set()).add(int(v))
+        for base, vs in sorted(values.items()):
+            if len(vs) > 1:
+                warn(f"{base} appears with different {what} ({', '.join(map(str, sorted(vs)))})"
+                     f" - rows without {col} cannot be assigned.")
 
     n = len(_WARNINGS_SEEN) - before
     print(f"  {n} warning(s)." if n else "  All checks passed.")
@@ -2419,6 +2463,8 @@ def _merge_into(target, df, subset):
         try:
             old = pd.read_csv(target, sep=";")
             old.columns = [str(c).strip() for c in old.columns]
+            if "BASENAME" in old.columns:   # rows archived before CHRG/M were filled by name
+                fill_charge_mult(old, charge_mult_by_name([df]))
             merged = pd.concat([old, df], ignore_index=True)
             merged = merged.drop_duplicates(subset=subset, keep="last")
         except Exception as e:
@@ -2837,8 +2883,8 @@ def build_parser():
     v.add_argument("-w", "--write", action="store_true",
                    help=f"add all new files to {DATA_FILE}")
     v.set_defaults(func=cmd_data_find)
-    verb("check", "check convergence, duplicates, coverage and charges").set_defaults(
-        func=cmd_data_check)
+    verb("check", "check convergence, duplicates, coverage, charges and multiplicities"
+         ).set_defaults(func=cmd_data_check)
     verb("edit", f"open {DATA_FILE} in $EDITOR").set_defaults(func=cmd_data_edit)
     v = verb("archive", "collect the data in ~/.qc_data/<project>_main_<role>.csv")
     v.description = ("Collect all data of the project per role in\n"

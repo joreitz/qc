@@ -35,18 +35,19 @@ def write_fixture_files(root):
     thermo = ["NAME;CHRG;M;METHOD;ENERGY;dU;dH;dG;SCFCONV;CPSCF/GEOCONV;CHAR;IMAGS"]
     sp1 = ["NAME;CHRG;M;METHOD;ENERGY;SCFCONV"]
     sp2 = ["NAME;CHRG;M;METHOD;ENERGY;SCFCONV"]
-    solv = ["NAME;CHRG;M;METHOD;SOLVENT;Gsolv(Eh)"]
-    bfreq = ["NAME;CHRG;M;METHOD;dG(Eh)"]
+    # like real outputs: solvation and bfreq files carry no charge/multiplicity
+    solv = ["NAME;METHOD;SOLVENT;Gsolv(Eh)"]
+    bfreq = ["NAME;METHOD;dG(Eh)"]
     boltz = ["NAME;CHRG;M;METHOD;SOLVENT;G_LOW;G_AV;dG_AV;STATUS;FAILED_CALC_COUNT"]
     for n, (q, m, et, du, dh, dg, e1, e2, s1, s2) in SPECIES.items():
         char, imag = ("TS", 1) if n == "c" else ("MIN", "")
         thermo.append(f"{n}.optfreq;{q};{m};wb97x-3c;{et};{du};{dh};{dg};True;False;{char};{imag}")
         sp1.append(f"{n}.sp;{q};{m};None;{e1};True")
         sp2.append(f"{n}.sp;{q};{m};pwpb95;{e2};True")
-        solv.append(f"{n};{q};{m};cosmors;1,2-dichloroethane;{s1}")
-        solv.append(f"{n};{q};{m};cosmors;thf;{s2}")
+        solv.append(f"{n};cosmors;1,2-dichloroethane;{s1}")
+        solv.append(f"{n};cosmors;thf;{s2}")
         if n.startswith("scanx") and n != "scanx.7":
-            bfreq.append(f"{n}.bfreq;{q};{m};gfn2;{dg - 0.002}")
+            bfreq.append(f"{n}.bfreq;gfn2;{dg - 0.002}")
         if n in ("a", "b", "c"):
             boltz.append(f"{n}_censo;{q};{m};r2scan-3c;dichloroethane;-1.0;-0.999;"
                          f"{0.001 * 627.5094740631:.4f};OK;0")
